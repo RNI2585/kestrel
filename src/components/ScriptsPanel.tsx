@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'react'
 import { SCRIPT_SAMPLES, describeStep, parseScript, type ScriptStep } from '../scripts'
 import { planFromChart, type ChartPlan } from '../chartPlan'
-import { averageBacktests, runBacktest, type BacktestAverages } from '../backtest'
+import {
+  averageBacktests,
+  runBacktest,
+  sweepCombo,
+  type BacktestAverages,
+  type SweepRow,
+} from '../backtest'
 import { DEFAULT_BOT } from '../bot'
 import { signedPct } from '../format'
 import type { Instrument } from '../market'
@@ -215,6 +221,125 @@ function PlanBacktest({ plan, instrument }: { plan: ChartPlan; instrument: Instr
   )
 }
 
+const SWEEP_STOPS = [0.8, 1.5, 2.5, 4]
+const SWEEP_TARGETS = [1.5, 3, 4.5, 6]
+const SWEEP_RISKS = [1, 2]
+const SWEEP_SEEDS = 4
+const SWEEP_TOTAL = SWEEP_STOPS.length * SWEEP_TARGETS.length * SWEEP_RISKS.length
+
+/**
+ * Runs the plan's strategy across a grid of stops, targets and risk settings,
+ * a few tapes per cell, and ranks them by expectancy per round trip. One combo
+ * per frame keeps the page responsive while it works.
+ */
+function PlanSweep({ plan, instrument }: { plan: ChartPlan; instrument: Instrument }) {
+  const [rows, setRows] = useState<SweepRow[] | null>(null)
+  const [running, setRunning] = useState(false)
+
+  // The whole grid is ~a few hundred milliseconds of replay, so it runs in one
+  // pass behind a paint rather than across timers that hidden tabs clamp.
+  const run = () => {
+    setRunning(true)
+    setRows(null)
+    window.setTimeout(() => {
+      const collected: SweepRow[] = []
+      for (const stopPct of SWEEP_STOPS) {
+        for (const takeProfitPct of SWEEP_TARGETS) {
+          for (const riskPct of SWEEP_RISKS) {
+            collected.push(
+              sweepCombo({
+                symbol: instrument.symbol,
+                vol: instrument.vol,
+                startPrice: instrument.base,
+                baseCfg: { ...DEFAULT_BOT, strategy: plan.strategy, params: {} },
+                seeds: Array.from({ length: SWEEP_SEEDS }, () =>
+                  Math.floor(Math.random() * 2 ** 30),
+                ),
+                stopPct,
+                takeProfitPct,
+                riskPct,
+              }),
+            )
+          }
+        }
+      }
+      collected.sort(
+        (a, b) => (b.perRoundTrip ?? -Infinity) - (a.perRoundTrip ?? -Infinity),
+      )
+      setRows(collected)
+      setRunning(false)
+    }, 40)
+  }
+
+  const positive = rows ? rows.filter((row) => (row.perRoundTrip ?? 0) > 0).length : 0
+
+  return (
+    <div className="chartplan__sweep">
+      <div className="scripts__codehead">
+        <span className="scripts__label">Risk &amp; exit sweep</span>
+        <button className="mini-btn" onClick={run} disabled={running}>
+          {running ? 'Sweeping…' : rows ? 'Sweep again' : `Sweep ${SWEEP_TOTAL} combos`}
+        </button>
+      </div>
+      <p className="scripts__note">
+        Holds {plan.strategyName} fixed and tries {SWEEP_STOPS.length} stops ×{' '}
+        {SWEEP_TARGETS.length} targets × {SWEEP_RISKS.length} risk levels, {SWEEP_SEEDS} tapes each,
+        ranked by expectancy per round trip.
+      </p>
+
+      {rows && (
+        <>
+          <p className="scripts__note">
+            {positive > 0
+              ? `${positive} of ${rows.length} combos earned a positive expectancy.`
+              : `No combo earned a positive expectancy — this setup does not clear costs on random tapes.`}
+          </p>
+          <div className="chartplan__sweeptable">
+            <table>
+              <thead>
+                <tr>
+                  <th>Stop</th>
+                  <th>Target</th>
+                  <th>Risk</th>
+                  <th>Avg return</th>
+                  <th>Expectancy</th>
+                  <th>Win</th>
+                  <th>Trades</th>
+                  <th>Green runs</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.slice(0, 6).map((row) => (
+                  <tr key={`${row.stopPct}-${row.takeProfitPct}-${row.riskPct}`}>
+                    <td>{row.stopPct}%</td>
+                    <td>{row.takeProfitPct}%</td>
+                    <td>{row.riskPct}%</td>
+                    <td className={row.returnPct >= 0 ? 'up' : 'down'}>{signedPct(row.returnPct)}</td>
+                    <td className={(row.perRoundTrip ?? 0) >= 0 ? 'up' : 'down'}>
+                      {row.perRoundTrip === null
+                        ? '—'
+                        : `${row.perRoundTrip >= 0 ? '+' : ''}${row.perRoundTrip.toFixed(3)}%`}
+                    </td>
+                    <td>{row.winRate === null ? '—' : `${row.winRate.toFixed(0)}%`}</td>
+                    <td>{row.trades.toFixed(1)}</td>
+                    <td>
+                      {row.profitableRuns}/{row.runs}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="scripts__note">
+            Top {Math.min(6, rows.length)} of {rows.length} combos. These are synthetic tapes, not
+            market history, so treat the ranking as a robustness check rather than a proven edge.
+          </p>
+        </>
+      )}
+    </div>
+  )
+}
+
 export default function ScriptsPanel({
   instruments,
   selected,
@@ -364,7 +489,13 @@ export default function ScriptsPanel({
               {(() => {
                 const instrument =
                   instruments.find((ins) => ins.symbol === plan.read.symbol) ?? instruments[0]
-                return instrument ? <PlanBacktest plan={plan} instrument={instrument} /> : null
+                if (!instrument) return null
+                return (
+                  <>
+                    <PlanBacktest plan={plan} instrument={instrument} />
+                    <PlanSweep plan={plan} instrument={instrument} />
+                  </>
+                )
               })()}
             </ScriptResult>
           )}

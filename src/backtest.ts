@@ -14,6 +14,19 @@ export interface BacktestAverages {
   profitableRuns: number
 }
 
+export interface SweepRow {
+  stopPct: number
+  takeProfitPct: number
+  riskPct: number
+  runs: number
+  returnPct: number
+  perRoundTrip: number | null
+  winRate: number | null
+  trades: number
+  maxDrawdownPct: number
+  profitableRuns: number
+}
+
 export interface BacktestResult {
   symbol: string
   seed: number
@@ -94,11 +107,14 @@ export function runBacktest(opts: {
     return portfolio.cash + (held ? held.qty * price : 0)
   }
 
-  for (let t = WARMUP; t < series.length; t++) {
+  // Push rather than slice: copying the window every tick was the bulk of the cost.
+  const history: number[] = []
+  for (let t = 0; t < series.length; t++) {
+    history.push(series[t])
+    if (t < WARMUP) continue
     const price = series[t]
-    const window = series.slice(0, t + 1)
     const held = portfolio.holdings[opts.symbol]
-    const signal = signalFor(opts.cfg.strategy, window, tuning)
+    const signal = signalFor(opts.cfg.strategy, history, tuning)
     let side: 'buy' | 'sell' | null = null
     let qty = 0
 
@@ -192,5 +208,46 @@ export function averageBacktests(runs: BacktestResult[]): BacktestAverages {
     bestReturnPct: Math.max(...returns),
     worstReturnPct: Math.min(...returns),
     profitableRuns: returns.filter((v) => v > 0).length,
+  }
+}
+
+/** One cell of the sweep: fixed stop, target and risk, averaged over several tapes. */
+export function sweepCombo(opts: {
+  symbol: string
+  vol: number
+  startPrice: number
+  baseCfg: BotConfig
+  seeds: number[]
+  stopPct: number
+  takeProfitPct: number
+  riskPct: number
+}): SweepRow {
+  const cfg: BotConfig = {
+    ...opts.baseCfg,
+    riskPct: opts.riskPct,
+    stopLossPct: opts.stopPct,
+    takeProfitPct: opts.takeProfitPct,
+  }
+  const runs = opts.seeds.map((seed) =>
+    runBacktest({
+      symbol: opts.symbol,
+      vol: opts.vol,
+      startPrice: opts.startPrice,
+      cfg,
+      seed,
+    }),
+  )
+  const avg = averageBacktests(runs)
+  return {
+    stopPct: opts.stopPct,
+    takeProfitPct: opts.takeProfitPct,
+    riskPct: opts.riskPct,
+    runs: avg.runs,
+    returnPct: avg.returnPct,
+    perRoundTrip: avg.perRoundTrip,
+    winRate: avg.winRate,
+    trades: avg.trades,
+    maxDrawdownPct: avg.maxDrawdownPct,
+    profitableRuns: avg.profitableRuns,
   }
 }
