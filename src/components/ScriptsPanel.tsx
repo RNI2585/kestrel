@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react'
 import { SCRIPT_SAMPLES, describeStep, parseScript, type ScriptStep } from '../scripts'
 import { planFromChart, type ChartPlan } from '../chartPlan'
-import { runBacktest, type BacktestResult } from '../backtest'
+import { averageBacktests, runBacktest, type BacktestAverages } from '../backtest'
 import { DEFAULT_BOT } from '../bot'
-import { money, signedPct } from '../format'
+import { signedPct } from '../format'
 import type { Instrument } from '../market'
 
 interface Props {
@@ -126,55 +126,58 @@ function ScriptResult({
   )
 }
 
-/** Replays the plan's own strategy, risk, stop and target over a synthetic tape. */
+const BACKTEST_RUNS = 24
+
+/** Replays the plan's own strategy, risk, stop and target over many synthetic tapes. */
 function PlanBacktest({ plan, instrument }: { plan: ChartPlan; instrument: Instrument }) {
-  const [result, setResult] = useState<BacktestResult | null>(null)
+  const [result, setResult] = useState<BacktestAverages | null>(null)
   const [running, setRunning] = useState(false)
 
   const run = () => {
     setRunning(true)
-    const seed = Math.floor(Math.random() * 2 ** 30)
+    const cfg = {
+      ...DEFAULT_BOT,
+      strategy: plan.strategy,
+      riskPct: plan.riskPct,
+      stopLossPct: plan.stopLossPct,
+      takeProfitPct: plan.takeProfitPct,
+    }
     window.setTimeout(() => {
-      setResult(
+      const runs = Array.from({ length: BACKTEST_RUNS }, () =>
         runBacktest({
           symbol: instrument.symbol,
           vol: instrument.vol,
           startPrice: instrument.base,
-          seed,
-          cfg: {
-            ...DEFAULT_BOT,
-            strategy: plan.strategy,
-            riskPct: plan.riskPct,
-            stopLossPct: plan.stopLossPct,
-            takeProfitPct: plan.takeProfitPct,
-          },
+          seed: Math.floor(Math.random() * 2 ** 30),
+          cfg,
         }),
       )
+      setResult(averageBacktests(runs))
       setRunning(false)
     }, 40)
   }
 
-  const sells = result ? Math.ceil(result.trades / 2) : 0
-  const perRoundTrip = result && sells > 0 ? result.returnPct / sells : null
+  const perRoundTrip = result?.perRoundTrip ?? null
 
   return (
     <div className="chartplan__backtest">
       <div className="scripts__codehead">
         <span className="scripts__label">Backtest this plan</span>
         <button className="mini-btn" onClick={run} disabled={running}>
-          {running ? 'Running…' : result ? 'Run again' : 'Run backtest'}
+          {running ? 'Running…' : result ? 'Run again' : `Run ${BACKTEST_RUNS} tapes`}
         </button>
       </div>
       <p className="scripts__note">
         Replays {plan.strategyName} with this plan’s {plan.riskPct}% risk, {plan.stopLossPct}% stop and{' '}
-        {plan.takeProfitPct}% target over a synthetic tape built from {instrument.symbol}’s volatility.
-        Each run draws a new path, so re-run to check how sensitive the edge is.
+        {plan.takeProfitPct}% target over {BACKTEST_RUNS} synthetic tapes built from {instrument.symbol}’s
+        volatility, then averages them. The range shows how much the outcome moves between paths — a
+        wide spread means the edge is fragile.
       </p>
       {result && (
         <>
           <dl className="backtest__stats">
             <div>
-              <dt>Plan return</dt>
+              <dt>Average return</dt>
               <dd className={result.returnPct >= 0 ? 'up' : 'down'}>{signedPct(result.returnPct)}</dd>
             </div>
             <div>
@@ -182,26 +185,29 @@ function PlanBacktest({ plan, instrument }: { plan: ChartPlan; instrument: Instr
               <dd className={result.buyHoldPct >= 0 ? 'up' : 'down'}>{signedPct(result.buyHoldPct)}</dd>
             </div>
             <div>
-              <dt>Trades</dt>
-              <dd>{result.trades}</dd>
+              <dt>Trades / tape</dt>
+              <dd>{result.trades.toFixed(1)}</dd>
             </div>
             <div>
               <dt>Win rate</dt>
               <dd>{result.winRate === null ? '—' : `${result.winRate.toFixed(0)}%`}</dd>
             </div>
             <div>
-              <dt>Return / round trip</dt>
+              <dt>Expectancy / round trip</dt>
               <dd className={perRoundTrip === null || perRoundTrip >= 0 ? 'up' : 'down'}>
-                {perRoundTrip === null ? '—' : signedPct(perRoundTrip)}
+                {perRoundTrip === null
+                  ? '—'
+                  : `${perRoundTrip >= 0 ? '+' : ''}${perRoundTrip.toFixed(3)}%`}
               </dd>
             </div>
             <div>
-              <dt>Max drawdown</dt>
+              <dt>Avg max drawdown</dt>
               <dd className="down">−{result.maxDrawdownPct.toFixed(2)}%</dd>
             </div>
           </dl>
           <p className="scripts__note">
-            Ended {money(result.startEquity)} → {money(result.endEquity)} over {result.ticks} synthetic ticks.
+            {result.runs} tapes · range {signedPct(result.worstReturnPct)} to{' '}
+            {signedPct(result.bestReturnPct)} · profitable on {result.profitableRuns} of {result.runs}.
           </p>
         </>
       )}

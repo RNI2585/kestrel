@@ -1,6 +1,19 @@
 import { signalFor, tunedParams, type BotConfig } from './bot'
 import { applyOrder, START_CASH, startingPortfolio } from './trade'
 
+export interface BacktestAverages {
+  runs: number
+  returnPct: number
+  buyHoldPct: number
+  trades: number
+  winRate: number | null
+  maxDrawdownPct: number
+  perRoundTrip: number | null
+  bestReturnPct: number
+  worstReturnPct: number
+  profitableRuns: number
+}
+
 export interface BacktestResult {
   symbol: string
   seed: number
@@ -136,5 +149,48 @@ export function runBacktest(opts: {
     buyHoldPct: ((last - series[WARMUP]) / series[WARMUP]) * 100,
     maxDrawdownPct: maxDrawdown,
     curve: downsample(curve),
+  }
+}
+
+/**
+ * Averages several replays so a plan is judged on its typical outcome rather
+ * than one lucky or unlucky synthetic path. `perRoundTrip` is the average
+ * return divided by the average number of round trips.
+ */
+export function averageBacktests(runs: BacktestResult[]): BacktestAverages {
+  const n = runs.length
+  if (n === 0) {
+    return {
+      runs: 0,
+      returnPct: 0,
+      buyHoldPct: 0,
+      trades: 0,
+      winRate: null,
+      maxDrawdownPct: 0,
+      perRoundTrip: null,
+      bestReturnPct: 0,
+      worstReturnPct: 0,
+      profitableRuns: 0,
+    }
+  }
+
+  const sum = (pick: (r: BacktestResult) => number) => runs.reduce((acc, r) => acc + pick(r), 0)
+  const returns = runs.map((r) => r.returnPct)
+  const roundTrips = runs.map((r) => Math.ceil(r.trades / 2))
+  const totalRoundTrips = roundTrips.reduce((a, b) => a + b, 0)
+  const winRates = runs.map((r) => r.winRate).filter((v): v is number => v !== null)
+  const avgReturn = sum((r) => r.returnPct) / n
+
+  return {
+    runs: n,
+    returnPct: avgReturn,
+    buyHoldPct: sum((r) => r.buyHoldPct) / n,
+    trades: sum((r) => r.trades) / n,
+    winRate: winRates.length > 0 ? winRates.reduce((a, b) => a + b, 0) / winRates.length : null,
+    maxDrawdownPct: sum((r) => r.maxDrawdownPct) / n,
+    perRoundTrip: totalRoundTrips > 0 ? avgReturn / (totalRoundTrips / n) : null,
+    bestReturnPct: Math.max(...returns),
+    worstReturnPct: Math.min(...returns),
+    profitableRuns: returns.filter((v) => v > 0).length,
   }
 }
