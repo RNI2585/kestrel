@@ -1,12 +1,16 @@
 import { useEffect, useState } from 'react'
 import { FEE, type Holding, type OrderType, type Side } from '../trade'
 import type { Instrument } from '../market'
+import { defineBroker, paperConnection, venueSymbol, type BrokerConnection } from '../brokers'
 import { money, price } from '../format'
 
 interface Props {
   instrument: Instrument
   cash: number
   holding?: Holding
+  connections: BrokerConnection[]
+  activeBrokerId: string
+  onRoute: (id: string) => void
   onSubmit: (
     side: Side,
     qty: number,
@@ -15,7 +19,15 @@ interface Props {
   ) => Promise<{ ok: true } | { ok: false; error: string }>
 }
 
-export default function TradeTicket({ instrument, cash, holding, onSubmit }: Props) {
+export default function TradeTicket({
+  instrument,
+  cash,
+  holding,
+  connections,
+  activeBrokerId,
+  onRoute,
+  onSubmit,
+}: Props) {
   const [side, setSide] = useState<Side>('buy')
   const [type, setType] = useState<OrderType>('market')
   const [qtyText, setQtyText] = useState('')
@@ -26,6 +38,12 @@ export default function TradeTicket({ instrument, cash, holding, onSubmit }: Pro
   useEffect(() => {
     setError('')
   }, [side, type])
+
+  const activeConn =
+    connections.find((c) => c.id === activeBrokerId) ?? connections[0] ?? paperConnection()
+  const activeDef = defineBroker(activeConn.kind)
+  const activePair = activeConn.kind === 'paper' ? instrument.symbol : venueSymbol(activeConn.kind, instrument.symbol)
+  const blocked = Boolean(activeConn.kind !== 'paper' && !activePair)
 
   const qty = Number(qtyText)
   const validQty = Number.isFinite(qty) && qty > 0 ? qty : 0
@@ -44,6 +62,10 @@ export default function TradeTicket({ instrument, cash, holding, onSubmit }: Pro
   }
 
   const submit = async () => {
+    if (blocked) {
+      setError(`${activeConn.label} does not list ${instrument.symbol}. Pick another venue.`)
+      return
+    }
     if (!validQty) {
       setError('Enter a quantity above zero.')
       return
@@ -112,6 +134,39 @@ export default function TradeTicket({ instrument, cash, holding, onSubmit }: Pro
         >
           Limit
         </button>
+      </div>
+
+      <div className="venue" role="group" aria-label="Route orders to">
+        <div className="venue__head">
+          <span>Route to</span>
+          <span>{activeConn.kind === 'paper' ? 'simulated fills' : activeDef.name}</span>
+        </div>
+        <div className="venue__row">
+          {connections.map((conn) => {
+            const pair = conn.kind === 'paper' ? instrument.symbol : venueSymbol(conn.kind, instrument.symbol)
+            const isActive = conn.id === activeConn.id
+            return (
+              <button
+                key={conn.id}
+                className={`venue__btn${isActive ? ' is-active' : ''}`}
+                aria-pressed={isActive}
+                disabled={!pair}
+                title={
+                  pair
+                    ? `${instrument.symbol} orders go to ${conn.label} as ${pair}`
+                    : `${conn.label} does not list ${instrument.symbol}`
+                }
+                onClick={() => {
+                  onRoute(conn.id)
+                  setError('')
+                }}
+              >
+                {conn.label}
+                <span className="venue__pair">{pair ?? 'not listed'}</span>
+              </button>
+            )
+          })}
+        </div>
       </div>
 
       <label className="field">
@@ -201,9 +256,26 @@ export default function TradeTicket({ instrument, cash, holding, onSubmit }: Pro
           : `Fill at ${price(instrument.price, instrument.dp)} · 2 basis points commission`}
       </p>
 
+      <p className="ticket__route">
+        {type === 'limit'
+          ? 'Limit orders rest in the terminal ledger until they fill; they are not sent to the venue.'
+          : activeConn.kind === 'paper'
+            ? 'Market fills are simulated locally by the paper ledger.'
+            : `Market orders are sent to ${activeConn.label}${
+                activePair && activePair !== instrument.symbol ? ` as ${activePair}` : ''
+              }.`}
+      </p>
+
+      {blocked && (
+        <p className="ticket__route ticket__route--warn">
+          {activeConn.label} does not list {instrument.symbol}. It trades{' '}
+          {activeDef.coverage.replace(/\.$/, '')}. Pick the paper ledger or another venue above.
+        </p>
+      )}
+
       {error && <p className="error">{error}</p>}
 
-      <button className="submit" onClick={() => void submit()} disabled={pending}>
+      <button className="submit" onClick={() => void submit()} disabled={pending || blocked}>
         {actionLabel}
       </button>
     </section>

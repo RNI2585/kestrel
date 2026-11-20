@@ -762,6 +762,9 @@ export default function App() {
                   instrument={instrument}
                   cash={portfolio.cash}
                   holding={portfolio.holdings[instrument.symbol]}
+                  connections={brokers}
+                  activeBrokerId={activeBrokerConn.id}
+                  onRoute={routeBroker}
                   onSubmit={submitOrder}
                 />
                 <PositionCard
