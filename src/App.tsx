@@ -150,15 +150,17 @@ function loadBot(raw: unknown): BotConfig {
   }
 }
 
-function loadState(): StoredState {
-  const empty = emptyState()
+/**
+ * Reads a saved terminal, used both for this browser's storage and for a
+ * backup file. Returns null when the text is not a usable save.
+ */
+function parseState(raw: string | null): StoredState | null {
+  if (!raw) return null
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return empty
     const parsed = JSON.parse(raw) as Partial<StoredState>
     const portfolio = parsed.portfolio
     if (!portfolio || typeof portfolio.cash !== 'number' || typeof portfolio.holdings !== 'object') {
-      return empty
+      return null
     }
     const brokers = Array.isArray(parsed.brokers)
       ? parsed.brokers.filter(
@@ -190,7 +192,23 @@ function loadState(): StoredState {
       routes,
     }
   } catch {
-    return empty
+    return null
+  }
+}
+
+function loadState(): StoredState {
+  return parseState(localStorage.getItem(STORAGE_KEY)) ?? emptyState()
+}
+
+/** Backups never carry broker keys, so restored venues ask for them again. */
+function withoutSecrets(state: StoredState): StoredState {
+  return {
+    ...state,
+    brokers: state.brokers.map((b) =>
+      b.kind === 'paper'
+        ? b
+        : { ...b, key: '', secret: '', status: 'error' as const, message: 'Keys are not part of a backup — re-enter them' },
+    ),
   }
 }
 
@@ -752,6 +770,65 @@ export default function App() {
 
   const updateBot = (patch: Partial<BotConfig>) => setBot((prev) => ({ ...prev, ...patch }))
 
+  /** Puts a whole saved terminal in place, refs included, so the next tick sees it. */
+  const applyState = (next: StoredState) => {
+    portfolioRef.current = next.portfolio
+    setPortfolio(next.portfolio)
+    setFills(next.fills)
+    botRef.current = next.bot
+    setBot(next.bot)
+    ordersRef.current = next.orders
+    setOrders(next.orders)
+    setEquitySeries(next.equity)
+    brokersRef.current = next.brokers
+    setBrokers(next.brokers)
+    activeBrokerRef.current = next.activeBroker
+    setActiveBroker(next.activeBroker)
+    routesRef.current = next.routes
+    setRoutes(next.routes)
+    cooldownsRef.current = {}
+  }
+
+  const exportState = () => {
+    const saved = withoutSecrets({
+      portfolio,
+      fills: fills.slice(0, 80),
+      bot,
+      orders: orders.slice(0, 40),
+      equity: equitySeries.slice(-240),
+      brokers,
+      activeBroker,
+      routes,
+    })
+    const blob = new Blob(
+      [JSON.stringify({ app: 'meridian', version: 1, savedAt: new Date().toISOString(), state: saved }, null, 2)],
+      { type: 'application/json' },
+    )
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `meridian-${new Date().toISOString().slice(0, 10)}.json`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const importState = async (file: File) => {
+    let next: StoredState | null = null
+    try {
+      const parsed = JSON.parse(await file.text()) as { state?: unknown }
+      const candidate = parsed && typeof parsed === 'object' && 'state' in parsed ? parsed.state : parsed
+      next = parseState(JSON.stringify(candidate))
+    } catch {
+      next = null
+    }
+    if (!next) {
+      window.alert('That file is not a Meridian backup.')
+      return
+    }
+    if (!window.confirm('Replace the current paper account with this backup?')) return
+    applyState(withoutSecrets(next))
+  }
+
   const change = changePct(instrument)
   const rangePoints = RANGES.find((r) => r.id === range)?.points ?? 160
   const chartData = instrument.history.slice(-rangePoints)
@@ -916,6 +993,8 @@ export default function App() {
                     equity={equity}
                     unrealized={unrealized}
                     onReset={resetAccount}
+                    onExport={exportState}
+                    onImport={(file) => void importState(file)}
                   />
                   <Positions rows={holdingRows} onSelect={setSelected} />
                   <EquityCurve points={equitySeries} deposited={portfolio.deposited} equity={equity} />

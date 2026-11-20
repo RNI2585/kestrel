@@ -2412,3 +2412,19 @@ h3 {
   margin: 2px 0 10px;
 }
 .chartplan__sweepapply .mini-btn { white-space: nowrap; }
+
+/* ---------- account backup controls ---------- */
+
+.panel__tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.panel__file {
+  cursor: pointer;
+}
+
+.panel__file input {
+  display: none;
+}
