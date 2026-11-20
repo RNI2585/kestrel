@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { CLASS_COLOR, MarketEngine, changePct, type AssetClass, type Instrument } from './market'
+import {
+  ASSET_CLASSES,
+  CLASS_COLOR,
+  MarketEngine,
+  changePct,
+  type AssetClass,
+  type Instrument,
+} from './market'
 import { DEFAULT_BOT, STRATEGIES, runBotStep, type BotConfig, type BotIntent } from './bot'
 import {
   applyOrder,
@@ -66,6 +73,8 @@ interface StoredState {
   equity: number[]
   brokers: BrokerConnection[]
   activeBroker: string
+  /** Venue the ticket picks for each asset class. */
+  routes: Partial<Record<AssetClass, string>>
 }
 
 function emptyState(): StoredState {
@@ -77,6 +86,7 @@ function emptyState(): StoredState {
     equity: [],
     brokers: defaultConnections(),
     activeBroker: PAPER_BROKER_ID,
+    routes: {},
   }
 }
 
@@ -100,6 +110,14 @@ function loadState(): StoredState {
     const activeBroker = brokers.some((b) => b.id === parsed.activeBroker)
       ? (parsed.activeBroker as string)
       : PAPER_BROKER_ID
+    const routes: Partial<Record<AssetClass, string>> = {}
+    const storedRoutes = parsed.routes
+    if (storedRoutes && typeof storedRoutes === 'object') {
+      for (const cls of ASSET_CLASSES) {
+        const id = (storedRoutes as Record<string, unknown>)[cls]
+        if (typeof id === 'string' && brokers.some((b) => b.id === id)) routes[cls] = id
+      }
+    }
 
     return {
       portfolio: { ...startingPortfolio(), ...portfolio },
@@ -113,6 +131,7 @@ function loadState(): StoredState {
       equity: Array.isArray(parsed.equity) ? parsed.equity.slice(-240) : [],
       brokers,
       activeBroker,
+      routes,
     }
   } catch {
     return empty
@@ -141,8 +160,11 @@ export default function App() {
   const [activeBroker, setActiveBroker] = useState<string>(initial.activeBroker)
   const activeBrokerRef = useRef(activeBroker)
   const routingRef = useRef(false)
+  const [routes, setRoutes] = useState<Partial<Record<AssetClass, string>>>(initial.routes)
+  const routesRef = useRef(routes)
 
   const [selected, setSelected] = useState('XAU')
+  const selectedRef = useRef(selected)
   const [filter, setFilter] = useState<AssetClass | 'All'>('All')
   const [range, setRange] = useState<RangeId>('1D')
   const [view, setView] = useState<ViewId>('trade')
@@ -326,12 +348,13 @@ export default function App() {
           equity: equitySeries.slice(-240),
           brokers,
           activeBroker,
+          routes,
         }),
       )
     } catch {
       // storage is a convenience; the terminal keeps running without it
     }
-  }, [portfolio, fills, bot, orders, equitySeries, brokers, activeBroker])
+  }, [portfolio, fills, bot, orders, equitySeries, brokers, activeBroker, routes])
 
   const instrument = engine.get(selected) ?? engine.instruments[0]
 
@@ -352,10 +375,42 @@ export default function App() {
   const activeBrokerConn =
     brokers.find((b) => b.id === activeBrokerRef.current) ?? paperConnection()
 
+  /**
+   * Routes orders to a venue and remembers it for the asset class of the
+   * instrument on screen, so the next instrument of that class opens on it.
+   * A venue that does not list the instrument is never remembered.
+   */
   const routeBroker = (id: string) => {
     activeBrokerRef.current = id
     setActiveBroker(id)
+    const conn = brokersRef.current.find((b) => b.id === id)
+    const current = engine.get(selectedRef.current) ?? engine.instruments[0]
+    if (!conn || !current) return
+    if (conn.kind !== 'paper' && !venueSymbol(conn.kind, current.symbol)) return
+    if (routesRef.current[current.cls] === id) return
+    const next = { ...routesRef.current, [current.cls]: id }
+    routesRef.current = next
+    setRoutes(next)
   }
+
+  // Switching instruments picks up the venue remembered for their asset class.
+  useEffect(() => {
+    selectedRef.current = selected
+    const current = engine.get(selected)
+    if (!current) return
+    const usable = (conn: BrokerConnection | undefined) =>
+      Boolean(conn && (conn.kind === 'paper' || venueSymbol(conn.kind, current.symbol)))
+    const preferredId = routesRef.current[current.cls]
+    const preferred = brokersRef.current.find((b) => b.id === preferredId)
+    let target: string | undefined
+    if (usable(preferred)) target = preferred!.id
+    else if (!usable(brokersRef.current.find((b) => b.id === activeBrokerRef.current))) {
+      target = PAPER_BROKER_ID
+    }
+    if (!target || target === activeBrokerRef.current) return
+    activeBrokerRef.current = target
+    setActiveBroker(target)
+  }, [selected, engine])
 
   const placeOrder = useCallback(
     async (
@@ -614,6 +669,11 @@ export default function App() {
     const next = brokersRef.current.filter((b) => b.id !== id)
     brokersRef.current = next
     setBrokers(next)
+    const keptRoutes = Object.fromEntries(
+      Object.entries(routesRef.current).filter(([, brokerId]) => brokerId !== id),
+    ) as Partial<Record<AssetClass, string>>
+    routesRef.current = keptRoutes
+    setRoutes(keptRoutes)
     if (activeBrokerRef.current === id) routeBroker(PAPER_BROKER_ID)
   }
 
@@ -764,6 +824,7 @@ export default function App() {
                   holding={portfolio.holdings[instrument.symbol]}
                   connections={brokers}
                   activeBrokerId={activeBrokerConn.id}
+                  remembered={routes[instrument.cls] === activeBrokerConn.id}
                   onRoute={routeBroker}
                   onSubmit={submitOrder}
                 />

@@ -10,6 +10,8 @@ interface Props {
   holding?: Holding
   connections: BrokerConnection[]
   activeBrokerId: string
+  /** The routed venue is the one saved for this instrument's asset class. */
+  remembered: boolean
   onRoute: (id: string) => void
   onSubmit: (
     side: Side,
@@ -25,6 +27,7 @@ export default function TradeTicket({
   holding,
   connections,
   activeBrokerId,
+  remembered,
   onRoute,
   onSubmit,
 }: Props) {
@@ -167,6 +170,12 @@ export default function TradeTicket({
             )
           })}
         </div>
+        {remembered && (
+          <p className="venue__note">
+            Saved for {instrument.cls} — switching instruments of this class picks {activeConn.label}{' '}
+            automatically.
+          </p>
+        )}
       </div>
 
       <label className="field">

@@ -1199,6 +1199,13 @@ h3 {
   color: var(--faint);
 }
 
+.venue__note {
+  margin: 6px 0 0;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--faint);
+}
+
 .ticket__route {
   margin: 6px 0 0;
   font-size: 10.5px;
