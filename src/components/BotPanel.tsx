@@ -215,8 +215,9 @@ export default function BotPanel({ bot, onChange, stats, instruments, brokerLabe
       {showAll && (
         <p className="hint">
           Stops and targets are checked on every scan, before the strategy signal. A symbol rests for
-          eight scans after it trades so the bot cannot churn one position. The strategy settings above
-          feed both the live bot and the backtest.
+          eight scans after it trades so the bot cannot churn one position, or three scans under
+          scalping so it can work a burst. The strategy settings above feed both the live bot and the
+          backtest.
         </p>
       )}
       <button className="link-btn link-btn--block" onClick={() => setShowAll((v) => !v)}>

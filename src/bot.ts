@@ -8,6 +8,7 @@ export type StrategyId =
   | 'rsi'
   | 'macd'
   | 'dip'
+  | 'scalp'
 
 /** One knob a strategy exposes. Values are stored as numbers in the bot config. */
 export interface ParamDef {
@@ -77,6 +78,11 @@ export const PARAM_DEFS: Record<StrategyId, ParamDef[]> = {
     { key: 'turn', label: 'Turn window', min: 2, max: 10, step: 1, value: 3, unit: ' ticks' },
     { key: 'exit', label: 'Exit near high', min: 0.1, max: 1.5, step: 0.1, value: 0.3, unit: '%' },
   ],
+  scalp: [
+    { key: 'burst', label: 'Burst window', min: 2, max: 8, step: 1, value: 3, unit: ' ticks' },
+    { key: 'punch', label: 'Punch threshold', min: 0.04, max: 0.5, step: 0.01, value: 0.12, unit: '%' },
+    { key: 'fade', label: 'Cut when faded', min: 0.2, max: 1, step: 0.05, value: 0.5, unit: '× punch' },
+  ],
 }
 
 /** The knobs the chosen strategy exposes, for the panel and the backtest label. */
@@ -126,9 +132,21 @@ export const STRATEGIES: { id: StrategyId; name: string; blurb: string }[] = [
     name: 'Dip buyer',
     blurb: 'Waits for a dip off the recent high and buys once price turns back up.',
   },
+  {
+    id: 'scalp',
+    name: 'Scalping',
+    blurb:
+      'Buys a fast punch up over a few ticks and cuts the moment the punch fades, holding moments rather than trends.',
+  },
 ]
 
 const COOLDOWN_TICKS = 8
+/** Scalping is meant to trade often, so it rests a symbol for far fewer scans. */
+const SCALP_COOLDOWN_TICKS = 3
+
+function cooldownFor(strategy: StrategyId): number {
+  return strategy === 'scalp' ? SCALP_COOLDOWN_TICKS : COOLDOWN_TICKS
+}
 
 function sma(history: number[], n: number): number | null {
   if (history.length < n) return null
@@ -283,6 +301,19 @@ export function signalFor(
     return { dir: 0, note: `${drop.toFixed(1)}% below the ${look}-tick high` }
   }
 
+  if (strategy === 'scalp') {
+    const burst = Math.max(2, Math.round(p.burst))
+    if (history.length < burst + 1) return { dir: 0, note: 'Warming up' }
+    const move = (last / history[history.length - 1 - burst] - 1) * 100
+    if (move >= p.punch) {
+      return { dir: 1, note: `Scalp punch ${move.toFixed(2)}% in ${burst} ticks` }
+    }
+    if (move <= -p.punch * p.fade) {
+      return { dir: -1, note: `Punch faded ${move.toFixed(2)}% — cutting the scalp` }
+    }
+    return { dir: 0, note: `Tape ${move >= 0 ? '+' : ''}${move.toFixed(2)}% in ${burst} ticks` }
+  }
+
   const look = Math.max(8, Math.round(p.window))
   if (history.length < look + 1) return { dir: 0, note: 'Warming up' }
   const window = history.slice(-look - 1, -1)
@@ -336,10 +367,11 @@ export function runBotStep(
     }, 0)
 
   const tuning = tunedParams(cfg)
+  const rest = cooldownFor(cfg.strategy)
 
   for (const ins of instruments) {
     if (!cfg.classes.includes(ins.cls)) continue
-    if (tick - (cooldowns[ins.symbol] ?? -999) < COOLDOWN_TICKS) continue
+    if (tick - (cooldowns[ins.symbol] ?? -999) < rest) continue
 
     const signal = signalFor(cfg.strategy, ins.history, tuning)
     const held = portfolio.holdings[ins.symbol]

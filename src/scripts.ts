@@ -56,6 +56,7 @@ const ALIASES: Record<string, string> = {
 }
 
 const STRATEGY_WORDS: { pattern: RegExp; id: StrategyId }[] = [
+  { pattern: /\bscalp(?:ing|er)?\b/, id: 'scalp' },
   { pattern: /\bmean[\s-]*revers(?:ion|ing|e)\b|\breversion\b/, id: 'meanrev' },
   { pattern: /\bmacd\b/, id: 'macd' },
   { pattern: /\brsi\b/, id: 'rsi' },
