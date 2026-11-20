@@ -3,3 +3,10 @@ dist/
 artifacts/
 .vercel/
 *.log
+
+# Android build output and signing material
+android/local.properties
+android/.gradle/
+android/app/build/
+*.jks
+*.keystore

@@ -67,12 +67,12 @@ type RangeId = (typeof RANGES)[number]['id']
 
 type ViewId = 'trade' | 'trades' | 'bot' | 'brokers' | 'scripts'
 
-const VIEWS: { id: ViewId; label: string; hint: string }[] = [
-  { id: 'trade', label: 'Trade setup', hint: 'Chart & ticket' },
-  { id: 'trades', label: 'Current trades', hint: 'Positions & fills' },
-  { id: 'bot', label: 'Bot & backtest', hint: 'Strategy settings' },
-  { id: 'brokers', label: 'Broker connections', hint: 'Venues & keys' },
-  { id: 'scripts', label: 'Scripts', hint: 'Chart or plain English' },
+const VIEWS: { id: ViewId; label: string; short: string; hint: string }[] = [
+  { id: 'trade', label: 'Trade setup', short: 'Trade', hint: 'Chart & ticket' },
+  { id: 'trades', label: 'Current trades', short: 'Trades', hint: 'Positions & fills' },
+  { id: 'bot', label: 'Bot & backtest', short: 'Bot', hint: 'Strategy settings' },
+  { id: 'brokers', label: 'Broker connections', short: 'Brokers', hint: 'Venues & keys' },
+  { id: 'scripts', label: 'Scripts', short: 'Scripts', hint: 'Chart or plain English' },
 ]
 
 interface StoredState {
@@ -1107,7 +1107,10 @@ export default function App() {
               aria-current={view === item.id}
               onClick={() => setView(item.id)}
             >
-              <span className="dock__label">{item.label}</span>
+              <span className="dock__label dock__label--full">{item.label}</span>
+              <span className="dock__label dock__label--short" aria-hidden="true">
+                {item.short}
+              </span>
               <span className="dock__hint">{item.hint}</span>
               {badge > 0 && <span className="dock__badge">{badge}</span>}
               {item.id === 'bot' && bot.running && <span className="dock__live" aria-hidden="true" />}

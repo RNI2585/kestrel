@@ -29,6 +29,49 @@ Because it is a web app rather than an `.apk`, installing it needs no sideloadin
 sources toggle and no update step: opening it while online picks up the newest build. Store
 publishing is the only thing this does not give you.
 
+## Build an Android app (APK)
+
+The repo is already wired for [Capacitor](https://capacitorjs.com) 8, which wraps the same web
+build in a native Android shell. The native project lives in `android/` and is committed, so you
+do not need to run `cap add android` again.
+
+You need, on your own machine:
+
+| Requirement | Version |
+| --- | --- |
+| Node.js | 22 or newer |
+| Android Studio | Otter 2025.2.1 or newer (bundles JDK 21) |
+| Android SDK platform | API 36, plus SDK Build Tools 36 |
+| Minimum Android version | 7.0 (API 24) |
+
+The JDK comes with Android Studio; do not install one separately. This machine has no Android
+SDK, so the APK itself has to be built where Android Studio is installed.
+
+```bash
+npm install
+npm run android:sync   # builds the web app and copies it into android/
+npm run android:open   # opens the project in Android Studio
+```
+
+In Android Studio: **Build → Build Bundle(s) / APK(s) → Build APK(s)**. The debug APK lands in
+`android/app/build/outputs/apk/debug/app-debug.apk`. Copy it to your phone (cable, Drive, or
+`adb install -r app-debug.apk` with USB debugging on and "install unknown apps" allowed for the
+file manager).
+
+A debug APK is signed with Android's debug key, which is fine for your own phone. For a Play Store
+upload or a release file you would need a keystore:
+
+```bash
+keytool -genkey -v -keystore meridian.jks -keyalg RSA -keysize 2048 -validity 10000 -alias meridian
+```
+
+Add it under **Build → Generate Signed Bundle / APK**; keep the `.jks` file and its passwords out
+of the repo (`.gitignore` already excludes nothing but you should never commit a keystore).
+
+After changing web code, rerun `npm run android:sync` before building, otherwise the APK ships the
+previous bundle. The web app and the APK are separate installs with separate `localStorage`:
+move an account between them with **Export / Import** in the Account panel.
+
 ## Your data
 
 - State lives in `this browser's localStorage` under `meridian.terminal.v1`, per origin. A copy
