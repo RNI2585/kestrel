@@ -10,6 +10,13 @@ export type StrategyId =
   | 'dip'
   | 'scalp'
 
+/** The money settings that travel with a strategy. */
+export interface RiskSettings {
+  riskPct: number
+  stopLossPct: number
+  takeProfitPct: number
+}
+
 /** One knob a strategy exposes. Values are stored as numbers in the bot config. */
 export interface ParamDef {
   key: string
@@ -26,10 +33,9 @@ export type StrategyParams = Partial<Record<StrategyId, Record<string, number>>>
 export interface BotConfig {
   running: boolean
   strategy: StrategyId
-  riskPct: number
-  stopLossPct: number
-  takeProfitPct: number
   maxAllocPct: number
+  /** Risk, stop and target per strategy, so switching strategies swaps the exits too. */
+  riskPrefs: Partial<Record<StrategyId, RiskSettings>>
   classes: AssetClass[]
   /** Per-strategy tuning. Anything missing falls back to the defaults below. */
   params: StrategyParams
@@ -40,13 +46,26 @@ export interface BotConfig {
 export const DEFAULT_BOT: BotConfig = {
   running: false,
   strategy: 'momentum',
-  riskPct: 4,
-  stopLossPct: 2.5,
-  takeProfitPct: 6,
+  riskPrefs: {},
   maxAllocPct: 60,
   classes: ['Stocks', 'Metals', 'Crypto', 'Fx', 'Energy'],
   params: {},
   routeToBroker: false,
+}
+
+/**
+ * Starting exits for each strategy. A trend trade needs room to run, while a
+ * scalp is cut quickly, so the numbers travel with the strategy rather than
+ * with the terminal.
+ */
+export const DEFAULT_RISK: Record<StrategyId, RiskSettings> = {
+  momentum: { riskPct: 4, stopLossPct: 2.5, takeProfitPct: 6 },
+  meanrev: { riskPct: 3, stopLossPct: 2, takeProfitPct: 4 },
+  breakout: { riskPct: 4, stopLossPct: 2.5, takeProfitPct: 8 },
+  rsi: { riskPct: 3, stopLossPct: 2, takeProfitPct: 5 },
+  macd: { riskPct: 4, stopLossPct: 2.5, takeProfitPct: 6 },
+  dip: { riskPct: 3, stopLossPct: 3, takeProfitPct: 5 },
+  scalp: { riskPct: 2, stopLossPct: 1, takeProfitPct: 2 },
 }
 
 export const PARAM_DEFS: Record<StrategyId, ParamDef[]> = {
@@ -99,6 +118,24 @@ export function defaultParams(strategy: StrategyId): Record<string, number> {
 /** The live tuning for a strategy: saved overrides on top of the defaults. */
 export function tunedParams(cfg: BotConfig): Record<string, number> {
   return { ...defaultParams(cfg.strategy), ...(cfg.params[cfg.strategy] ?? {}) }
+}
+
+/** The risk, stop and target the chosen strategy trades with. */
+export function activeRisk(cfg: BotConfig): RiskSettings {
+  return { ...DEFAULT_RISK[cfg.strategy], ...(cfg.riskPrefs[cfg.strategy] ?? {}) }
+}
+
+/** Stores new exit settings against the chosen strategy. */
+export function patchRisk(cfg: BotConfig, patch: Partial<RiskSettings>): BotConfig {
+  return {
+    ...cfg,
+    riskPrefs: { ...cfg.riskPrefs, [cfg.strategy]: { ...activeRisk(cfg), ...patch } },
+  }
+}
+
+/** Exits for a replay that should not use the strategy's saved settings. */
+export function withRisk(cfg: BotConfig, settings: RiskSettings): BotConfig {
+  return { ...cfg, riskPrefs: { ...cfg.riskPrefs, [cfg.strategy]: { ...settings } } }
 }
 
 export const STRATEGIES: { id: StrategyId; name: string; blurb: string }[] = [
@@ -367,6 +404,7 @@ export function runBotStep(
     }, 0)
 
   const tuning = tunedParams(cfg)
+  const risk = activeRisk(cfg)
   const rest = cooldownFor(cfg.strategy)
 
   for (const ins of instruments) {
@@ -381,11 +419,11 @@ export function runBotStep(
 
     if (held && held.qty > 1e-8) {
       const gain = (ins.price / held.avgCost - 1) * 100
-      if (gain <= -cfg.stopLossPct) {
+      if (gain <= -risk.stopLossPct) {
         side = 'sell'
         qty = held.qty
         reason = `Stop loss at ${gain.toFixed(2)}%`
-      } else if (gain >= cfg.takeProfitPct) {
+      } else if (gain >= risk.takeProfitPct) {
         side = 'sell'
         qty = held.qty
         reason = `Take profit at +${gain.toFixed(2)}%`
@@ -397,7 +435,7 @@ export function runBotStep(
     } else if (signal.dir > 0) {
       const equity = portfolio.cash + holdingsValue()
       const room = equity * (cfg.maxAllocPct / 100) - holdingsValue()
-      const budget = Math.min(equity * (cfg.riskPct / 100), room, portfolio.cash)
+      const budget = Math.min(equity * (risk.riskPct / 100), room, portfolio.cash)
       if (budget > Math.max(20, equity * 0.005)) {
         side = 'buy'
         qty = budget / ins.price

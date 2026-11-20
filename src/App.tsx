@@ -7,7 +7,17 @@ import {
   type AssetClass,
   type Instrument,
 } from './market'
-import { DEFAULT_BOT, STRATEGIES, runBotStep, type BotConfig, type BotIntent } from './bot'
+import {
+  DEFAULT_BOT,
+  DEFAULT_RISK,
+  STRATEGIES,
+  patchRisk,
+  runBotStep,
+  type BotConfig,
+  type BotIntent,
+  type RiskSettings,
+  type StrategyId,
+} from './bot'
 import {
   applyOrder,
   limitReached,
@@ -90,6 +100,56 @@ function emptyState(): StoredState {
   }
 }
 
+/**
+ * Rebuilds the bot config. Saves from before per-strategy exits held one shared
+ * set, which is kept with the strategy that was armed at the time.
+ */
+function loadBot(raw: unknown): BotConfig {
+  const stored = (raw && typeof raw === 'object' ? raw : {}) as Partial<BotConfig> &
+    Partial<RiskSettings>
+  const strategy = STRATEGIES.some((s) => s.id === stored.strategy)
+    ? (stored.strategy as StrategyId)
+    : DEFAULT_BOT.strategy
+
+  const riskPrefs: Partial<Record<StrategyId, RiskSettings>> = {}
+  const savedPrefs = stored.riskPrefs
+  if (savedPrefs && typeof savedPrefs === 'object') {
+    for (const s of STRATEGIES) {
+      const saved = savedPrefs[s.id]
+      if (saved) riskPrefs[s.id] = { ...DEFAULT_RISK[s.id], ...saved }
+    }
+  }
+  if (
+    !riskPrefs[strategy] &&
+    (stored.riskPct !== undefined ||
+      stored.stopLossPct !== undefined ||
+      stored.takeProfitPct !== undefined)
+  ) {
+    riskPrefs[strategy] = {
+      ...DEFAULT_RISK[strategy],
+      ...(typeof stored.riskPct === 'number' ? { riskPct: stored.riskPct } : {}),
+      ...(typeof stored.stopLossPct === 'number' ? { stopLossPct: stored.stopLossPct } : {}),
+      ...(typeof stored.takeProfitPct === 'number'
+        ? { takeProfitPct: stored.takeProfitPct }
+        : {}),
+    }
+  }
+
+  return {
+    ...DEFAULT_BOT,
+    running: stored.running === true,
+    strategy,
+    maxAllocPct:
+      typeof stored.maxAllocPct === 'number' ? stored.maxAllocPct : DEFAULT_BOT.maxAllocPct,
+    classes: Array.isArray(stored.classes)
+      ? stored.classes.filter((c): c is AssetClass => ASSET_CLASSES.includes(c))
+      : DEFAULT_BOT.classes,
+    params: { ...(stored.params ?? {}) },
+    routeToBroker: stored.routeToBroker === true,
+    riskPrefs,
+  }
+}
+
 function loadState(): StoredState {
   const empty = emptyState()
   try {
@@ -122,11 +182,7 @@ function loadState(): StoredState {
     return {
       portfolio: { ...startingPortfolio(), ...portfolio },
       fills: Array.isArray(parsed.fills) ? parsed.fills.slice(0, 160) : [],
-      bot: {
-        ...DEFAULT_BOT,
-        ...(parsed.bot ?? {}),
-        params: { ...(parsed.bot?.params ?? {}) },
-      },
+      bot: loadBot(parsed.bot),
       orders: Array.isArray(parsed.orders) ? parsed.orders.slice(0, 40) : [],
       equity: Array.isArray(parsed.equity) ? parsed.equity.slice(-240) : [],
       brokers,
@@ -563,11 +619,11 @@ export default function App() {
             break
           }
           case 'risk': {
-            const patch: Partial<BotConfig> = {}
+            const patch: Partial<RiskSettings> = {}
             if (step.riskPct !== undefined) patch.riskPct = step.riskPct
             if (step.stopLossPct !== undefined) patch.stopLossPct = step.stopLossPct
             if (step.takeProfitPct !== undefined) patch.takeProfitPct = step.takeProfitPct
-            setBot((prev) => ({ ...prev, ...patch }))
+            setBot((prev) => patchRisk(prev, patch))
             log.push('Risk settings updated.')
             break
           }
@@ -615,7 +671,7 @@ export default function App() {
     select: (symbol) => setSelected(symbol),
     bot: (patch) => setBot((prev) => ({ ...prev, ...patch })),
     strategy: (id) => setBot((prev) => ({ ...prev, strategy: id })),
-    risk: (patch) => setBot((prev) => ({ ...prev, ...patch })),
+    risk: (patch) => setBot((prev) => patchRisk(prev, patch)),
     route: (target) => {
       if (target === 'paper') {
         routeBroker(PAPER_BROKER_ID)

@@ -8,7 +8,7 @@ import {
   type BacktestAverages,
   type SweepRow,
 } from '../backtest'
-import { DEFAULT_BOT } from '../bot'
+import { DEFAULT_BOT, withRisk } from '../bot'
 import { signedPct } from '../format'
 import type { Instrument } from '../market'
 
@@ -143,13 +143,11 @@ function PlanBacktest({ plan, instrument }: { plan: ChartPlan; instrument: Instr
 
   const run = () => {
     setRunning(true)
-    const cfg = {
-      ...DEFAULT_BOT,
-      strategy: plan.strategy,
+    const cfg = withRisk({ ...DEFAULT_BOT, strategy: plan.strategy }, {
       riskPct: plan.riskPct,
       stopLossPct: plan.stopLossPct,
       takeProfitPct: plan.takeProfitPct,
-    }
+    })
     window.setTimeout(() => {
       const runs = Array.from({ length: BACKTEST_RUNS }, () =>
         runBacktest({

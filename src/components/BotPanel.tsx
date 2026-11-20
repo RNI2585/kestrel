@@ -1,8 +1,11 @@
 import { useState } from 'react'
 import {
+  DEFAULT_RISK,
   STRATEGIES,
+  activeRisk,
   defaultParams,
   paramDefs,
+  patchRisk,
   type BotConfig,
   type StrategyId,
 } from '../bot'
@@ -53,6 +56,12 @@ export default function BotPanel({ bot, onChange, stats, instruments, brokerLabe
   const defs = paramDefs(bot.strategy)
   const overrides = bot.params[bot.strategy] ?? {}
   const values = { ...defaultParams(bot.strategy), ...overrides }
+  const risk = activeRisk(bot)
+  const riskDefaults = DEFAULT_RISK[bot.strategy]
+  const riskTuned =
+    risk.riskPct !== riskDefaults.riskPct ||
+    risk.stopLossPct !== riskDefaults.stopLossPct ||
+    risk.takeProfitPct !== riskDefaults.takeProfitPct
 
   const toggleClass = (cls: AssetClass) => {
     const next = bot.classes.includes(cls)
@@ -129,31 +138,44 @@ export default function BotPanel({ bot, onChange, stats, instruments, brokerLabe
 
       <Slider
         label="Risk per trade"
-        value={bot.riskPct}
+        value={risk.riskPct}
         min={1}
         max={10}
         step={0.5}
-        display={`${bot.riskPct}% of equity`}
-        onChange={(riskPct) => onChange({ riskPct })}
+        display={`${risk.riskPct}% of equity`}
+        onChange={(riskPct) => onChange(patchRisk(bot, { riskPct }))}
       />
       <Slider
         label="Stop loss"
-        value={bot.stopLossPct}
+        value={risk.stopLossPct}
         min={1}
         max={10}
         step={0.5}
-        display={`${bot.stopLossPct}%`}
-        onChange={(stopLossPct) => onChange({ stopLossPct })}
+        display={`${risk.stopLossPct}%`}
+        onChange={(stopLossPct) => onChange(patchRisk(bot, { stopLossPct }))}
       />
       <Slider
         label="Take profit"
-        value={bot.takeProfitPct}
+        value={risk.takeProfitPct}
         min={2}
         max={25}
         step={1}
-        display={`${bot.takeProfitPct}%`}
-        onChange={(takeProfitPct) => onChange({ takeProfitPct })}
+        display={`${risk.takeProfitPct}%`}
+        onChange={(takeProfitPct) => onChange(patchRisk(bot, { takeProfitPct }))}
       />
+      {riskTuned && (
+        <button
+          className="link-btn link-btn--block"
+          onClick={() => {
+            const next = { ...bot.riskPrefs }
+            delete next[bot.strategy]
+            onChange({ riskPrefs: next })
+          }}
+        >
+          Reset {strategy?.name.toLowerCase()} risk to {riskDefaults.riskPct}% /{' '}
+          {riskDefaults.stopLossPct}% / {riskDefaults.takeProfitPct}%
+        </button>
+      )}
       <Slider
         label="Max invested"
         value={bot.maxAllocPct}
@@ -214,10 +236,11 @@ export default function BotPanel({ bot, onChange, stats, instruments, brokerLabe
 
       {showAll && (
         <p className="hint">
-          Stops and targets are checked on every scan, before the strategy signal. A symbol rests for
-          eight scans after it trades so the bot cannot churn one position, or three scans under
-          scalping so it can work a burst. The strategy settings above feed both the live bot and the
-          backtest.
+          Stops and targets are checked on every scan, before the strategy signal. Each strategy keeps
+          its own risk, stop and target — scalping starts tighter than trend following — and remembers
+          any tweaks you make, so switching strategies swaps the exits too. A symbol rests for eight
+          scans after it trades so the bot cannot churn one position, or three scans under scalping so
+          it can work a burst. The strategy settings above feed both the live bot and the backtest.
         </p>
       )}
       <button className="link-btn link-btn--block" onClick={() => setShowAll((v) => !v)}>

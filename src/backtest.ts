@@ -1,4 +1,4 @@
-import { signalFor, tunedParams, type BotConfig } from './bot'
+import { activeRisk, signalFor, tunedParams, withRisk, type BotConfig } from './bot'
 import { applyOrder, START_CASH, startingPortfolio } from './trade'
 
 export interface BacktestAverages {
@@ -101,6 +101,7 @@ export function runBacktest(opts: {
   let maxDrawdown = 0
   const curve: number[] = [START_CASH]
   const tuning = tunedParams(opts.cfg)
+  const risk = activeRisk(opts.cfg)
 
   const equityAt = (price: number) => {
     const held = portfolio.holdings[opts.symbol]
@@ -120,13 +121,13 @@ export function runBacktest(opts: {
 
     if (held && held.qty > 1e-8) {
       const gain = (price / held.avgCost - 1) * 100
-      if (gain <= -opts.cfg.stopLossPct || gain >= opts.cfg.takeProfitPct || signal.dir < 0) {
+      if (gain <= -risk.stopLossPct || gain >= risk.takeProfitPct || signal.dir < 0) {
         side = 'sell'
         qty = held.qty
       }
     } else if (signal.dir > 0) {
       const equity = equityAt(price)
-      const budget = Math.min(equity * (opts.cfg.riskPct / 100), portfolio.cash)
+      const budget = Math.min(equity * (risk.riskPct / 100), portfolio.cash)
       if (budget > equity * 0.005) {
         side = 'buy'
         qty = budget / price
@@ -222,12 +223,11 @@ export function sweepCombo(opts: {
   takeProfitPct: number
   riskPct: number
 }): SweepRow {
-  const cfg: BotConfig = {
-    ...opts.baseCfg,
+  const cfg: BotConfig = withRisk({ ...opts.baseCfg }, {
     riskPct: opts.riskPct,
     stopLossPct: opts.stopPct,
     takeProfitPct: opts.takeProfitPct,
-  }
+  })
   const runs = opts.seeds.map((seed) =>
     runBacktest({
       symbol: opts.symbol,
