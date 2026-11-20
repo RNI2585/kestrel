@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { SCRIPT_SAMPLES, describeStep, parseScript, type ScriptStep } from '../scripts'
-import { planFromChart, type ChartPlan } from '../chartPlan'
+import { applyPlanExits, planFromChart, type ChartPlan } from '../chartPlan'
 import {
   averageBacktests,
   runBacktest,
@@ -21,6 +21,8 @@ interface Props {
   holdingQty: number
   onRun: (steps: ScriptStep[]) => Promise<string[]>
   onShowLevels: (plan: ChartPlan) => void
+  /** Updates the chart overlay without leaving the plan panel. */
+  onLevelsChange: (plan: ChartPlan) => void
 }
 
 function ScriptResult({
@@ -232,7 +234,15 @@ const SWEEP_TOTAL = SWEEP_STOPS.length * SWEEP_TARGETS.length * SWEEP_RISKS.leng
  * a few tapes per cell, and ranks them by expectancy per round trip. One combo
  * per frame keeps the page responsive while it works.
  */
-function PlanSweep({ plan, instrument }: { plan: ChartPlan; instrument: Instrument }) {
+function PlanSweep({
+  plan,
+  instrument,
+  onApply,
+}: {
+  plan: ChartPlan
+  instrument: Instrument
+  onApply: (row: SweepRow) => void
+}) {
   const [rows, setRows] = useState<SweepRow[] | null>(null)
   const [running, setRunning] = useState(false)
 
@@ -294,6 +304,22 @@ function PlanSweep({ plan, instrument }: { plan: ChartPlan; instrument: Instrume
               ? `${positive} of ${rows.length} combos earned a positive expectancy.`
               : `No combo earned a positive expectancy — this setup does not clear costs on random tapes.`}
           </p>
+          {plan.entry !== null && (
+            <div className="chartplan__sweepapply">
+              <button
+                className="mini-btn"
+                onClick={() => onApply(rows[0])}
+                disabled={(rows[0].perRoundTrip ?? 0) <= 0}
+              >
+                Apply best to plan
+              </button>
+              <span className="scripts__meta">
+                {rows[0].stopPct}% stop · {rows[0].takeProfitPct}% target · {rows[0].riskPct}% risk
+                {' '}· {rows[0].perRoundTrip === null ? '—' : `${rows[0].perRoundTrip >= 0 ? '+' : ''}${rows[0].perRoundTrip.toFixed(3)}%`} per round trip
+              </span>
+              {plan.exitsFrom === 'sweep' && <span className="scripts__meta">applied</span>}
+            </div>
+          )}
           <div className="chartplan__sweeptable">
             <table>
               <thead>
@@ -349,11 +375,24 @@ export default function ScriptsPanel({
   holdingQty,
   onRun,
   onShowLevels,
+  onLevelsChange,
 }: Props) {
   const [mode, setMode] = useState<'chart' | 'describe'>('chart')
   const [description, setDescription] = useState('')
   const [submitted, setSubmitted] = useState('')
   const [plan, setPlan] = useState<ChartPlan | null>(null)
+
+  /** Swaps the plan's stop, target and risk for the sweep winner and redraws its levels. */
+  const applySweep = (row: SweepRow) => {
+    if (!plan) return
+    const next = applyPlanExits(
+      plan,
+      { stopLossPct: row.stopPct, takeProfitPct: row.takeProfitPct, riskPct: row.riskPct },
+      { equity, cash },
+    )
+    setPlan(next)
+    onLevelsChange(next)
+  }
 
   const parsed = parseScript(submitted, instruments.map((ins) => ins.symbol))
 
@@ -480,6 +519,13 @@ export default function ScriptsPanel({
                 </div>
               )}
 
+              {plan.exitsFrom === 'sweep' && (
+                <p className="scripts__note">
+                  Stop, target and risk now come from the best sweep combo — the entry and the read
+                  are unchanged. Levels on the chart have been redrawn to match.
+                </p>
+              )}
+
               <ul className="chartplan__notes">
                 {plan.read.notes.map((note) => (
                   <li key={note}>{note}</li>
@@ -493,7 +539,7 @@ export default function ScriptsPanel({
                 return (
                   <>
                     <PlanBacktest plan={plan} instrument={instrument} />
-                    <PlanSweep plan={plan} instrument={instrument} />
+                    <PlanSweep plan={plan} instrument={instrument} onApply={applySweep} />
                   </>
                 )
               })()}

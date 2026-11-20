@@ -45,6 +45,8 @@ export interface ChartPlan {
   steps: ScriptStep[]
   code: string
   levels: PlanLevel[]
+  /** where the stop, target and risk came from — the chart read or a sweep result */
+  exitsFrom: 'chart' | 'sweep'
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -273,5 +275,78 @@ export function planFromChart(
     steps,
     code,
     levels,
+    exitsFrom: 'chart',
+  }
+}
+
+/**
+ * Rebuilds a plan with a different stop, target and risk — the entry and the
+ * chart read stay as they were, so only sizing, exits, the chart levels and
+ * the generated steps change. A sized-down account can end up with no order,
+ * in which case the script just arms the strategy and the risk settings.
+ */
+export function applyPlanExits(
+  plan: ChartPlan,
+  exits: { stopLossPct: number; takeProfitPct: number; riskPct: number },
+  options: { equity: number; cash: number },
+): ChartPlan {
+  if (plan.entry === null) return { ...plan, exitsFrom: 'chart' }
+
+  const dp = plan.read.dp
+  const entry = plan.entry
+  const stopLossPct = roundTo(exits.stopLossPct, 1)
+  const takeProfitPct = roundTo(exits.takeProfitPct, 1)
+  const riskPct = exits.riskPct
+  const stop = roundTo(entry * (1 - stopLossPct / 100), dp)
+  const target = roundTo(entry * (1 + takeProfitPct / 100), dp)
+
+  const riskBudget = options.equity * (riskPct / 100)
+  const perUnit = entry - stop
+  const notionalCap = Math.min(options.cash, options.equity * 0.25)
+  const qty =
+    perUnit > 0 && entry > 0
+      ? roundQty(Math.min(riskBudget / perUnit, notionalCap / entry))
+      : 0
+
+  const steps: ScriptStep[] = []
+  if (plan.steps[0]?.kind === 'close') steps.push({ kind: 'close', symbol: plan.read.symbol })
+  steps.push({ kind: 'select', symbol: plan.read.symbol })
+  steps.push({ kind: 'strategy', strategy: plan.strategy })
+  steps.push({ kind: 'risk', riskPct, stopLossPct, takeProfitPct })
+  if (qty > 0) {
+    steps.push({ kind: 'order', symbol: plan.read.symbol, side: 'buy', qty, limit: entry })
+  }
+
+  const fmt = (value: number) => value.toFixed(dp)
+  const summary =
+    `${plan.read.symbol} is ${plan.read.bias}, ${plan.read.rangePct.toFixed(0)}% up its ${plan.read.bars}-bar range with RSI ${plan.read.rsi.toFixed(0)}. ` +
+    (qty > 0
+      ? `The plan rests a buy for ${qty} at ${fmt(entry)}, protects it at ${fmt(stop)} (−${stopLossPct}%) and takes profit at ${fmt(target)} (+${takeProfitPct}%) on ${riskPct}% equity risk, with ${plan.strategyName} armed for the bot.`
+      : `The account is too small to size this trade at ${riskPct}% risk, so the script only arms ${plan.strategyName} and the new exits for the bot.`) +
+    ` The exits and risk come from the best result of the sweep.`
+
+  const code = [
+    `// Meridian chart plan — ${plan.read.symbol} read from the visible chart`,
+    `// exits from the best sweep combo: ${stopLossPct}% stop · ${takeProfitPct}% target · ${riskPct}% risk`,
+    ...steps.map(stepCode),
+  ].join('\n')
+
+  return {
+    ...plan,
+    stop,
+    target,
+    qty,
+    riskPct,
+    stopLossPct,
+    takeProfitPct,
+    steps,
+    code,
+    summary,
+    levels: [
+      { label: 'Entry', price: entry, tone: 'entry' },
+      { label: 'Stop', price: stop, tone: 'stop' },
+      { label: 'Target', price: target, tone: 'target' },
+    ],
+    exitsFrom: 'sweep',
   }
 }

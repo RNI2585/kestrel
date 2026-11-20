@@ -884,6 +884,9 @@ export default function App() {
                   setSelected(plan.read.symbol)
                   setView('trade')
                 }}
+                onLevelsChange={(plan: ChartPlan) =>
+                  setPlanLevels({ symbol: plan.read.symbol, levels: plan.levels })
+                }
               />
             </div>
           )}

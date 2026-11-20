@@ -2228,3 +2228,12 @@ h3 {
 .chartplan__sweeptable tr:first-child td {
   background: rgba(79, 181, 138, 0.08);
 }
+
+.chartplan__sweepapply {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 2px 0 10px;
+}
+.chartplan__sweepapply .mini-btn { white-space: nowrap; }
