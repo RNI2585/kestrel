@@ -66,7 +66,12 @@ keytool -genkey -v -keystore meridian.jks -keyalg RSA -keysize 2048 -validity 10
 ```
 
 Add it under **Build → Generate Signed Bundle / APK**; keep the `.jks` file and its passwords out
-of the repo (`.gitignore` already excludes nothing but you should never commit a keystore).
+of the repo (`.gitignore` already excludes `*.jks` and `*.keystore`, but a committed key is still a
+leaked key).
+
+The launcher icon, round icon, adaptive icon layers and splash screens are Meridian's own branding
+(`android/app/src/main/res/mipmap-*` and `drawable-port-*` / `drawable-land-*`), drawn from the
+same three-bar mark as the web icons, so the installed app does not look like a Capacitor demo.
 
 After changing web code, rerun `npm run android:sync` before building, otherwise the APK ships the
 previous bundle. The web app and the APK are separate installs with separate `localStorage`:
