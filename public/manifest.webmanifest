@@ -1,13 +1,13 @@
 {
-  "name": "Meridian — paper trading terminal",
-  "short_name": "Meridian",
-  "description": "A self-contained paper trading terminal for stocks, metals, FX, energy and crypto.",
+  "name": "Kestrel — paper desk & broker bridge",
+  "short_name": "Kestrel",
+  "description": "A self-contained paper desk for stocks, metals, FX, energy and crypto, with a broker bridge and a scan across seven strategies.",
   "id": "/",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "background_color": "#0f1214",
-  "theme_color": "#0f1214",
+  "theme_color": "#06080a",
   "categories": ["finance", "productivity"],
   "icons": [
     {

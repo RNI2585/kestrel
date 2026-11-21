@@ -5,19 +5,11 @@ interface Props {
   portfolio: Portfolio
   equity: number
   unrealized: number
-  onReset: () => void
-  onExport: () => void
-  onImport: (file: File) => void
+  /** Reset, backup and restore live on the settings screen, not here. */
+  onOpenSettings: () => void
 }
 
-export default function AccountPanel({
-  portfolio,
-  equity,
-  unrealized,
-  onReset,
-  onExport,
-  onImport,
-}: Props) {
+export default function AccountPanel({ portfolio, equity, unrealized, onOpenSettings }: Props) {
   const pnl = equity - portfolio.deposited
   const pnlPct = (pnl / portfolio.deposited) * 100
 
@@ -26,23 +18,8 @@ export default function AccountPanel({
       <header className="panel__head">
         <h2>Account</h2>
         <div className="panel__tools">
-          <button className="link-btn" onClick={onExport}>
-            Export
-          </button>
-          <label className="link-btn panel__file">
-            Import
-            <input
-              type="file"
-              accept="application/json,.json"
-              onChange={(event) => {
-                const file = event.target.files?.[0]
-                event.target.value = ''
-                if (file) onImport(file)
-              }}
-            />
-          </label>
-          <button className="link-btn" onClick={onReset}>
-            Reset
+          <button className="link-btn" onClick={onOpenSettings}>
+            Manage
           </button>
         </div>
       </header>

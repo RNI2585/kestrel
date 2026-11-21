@@ -39,6 +39,12 @@ export interface BacktestResult {
   returnPct: number
   buyHoldPct: number
   maxDrawdownPct: number
+  /** Mean bar return divided by its standard deviation, per tick. */
+  sharpe: number | null
+  /** Gross winning trades divided by gross losing trades. */
+  profitFactor: number | null
+  /** Average win/loss in multiples of what the stop risked. */
+  avgR: number | null
   curve: number[]
 }
 
@@ -100,6 +106,10 @@ export function runBacktest(opts: {
   let peak = START_CASH
   let maxDrawdown = 0
   const curve: number[] = [START_CASH]
+  const equityBars: number[] = [START_CASH]
+  let grossWin = 0
+  let grossLoss = 0
+  const rMultiples: number[] = []
   const tuning = tunedParams(opts.cfg)
   const risk = activeRisk(opts.cfg)
 
@@ -124,6 +134,8 @@ export function runBacktest(opts: {
       if (gain <= -risk.stopLossPct || gain >= risk.takeProfitPct || signal.dir < 0) {
         side = 'sell'
         qty = held.qty
+        // R multiple: how far the trade travelled in units of the stop risked.
+        rMultiples.push(gain / (risk.stopLossPct || 1))
       }
     } else if (signal.dir > 0) {
       const equity = equityAt(price)
@@ -139,7 +151,15 @@ export function runBacktest(opts: {
       if (result.ok) {
         portfolio = result.portfolio
         trades += 1
-        if (side === 'sell' && (result.pnl ?? 0) > 0) wins += 1
+        if (side === 'sell') {
+          const pnl = result.pnl ?? 0
+          if (pnl > 0) {
+            wins += 1
+            grossWin += pnl
+          } else {
+            grossLoss += Math.abs(pnl)
+          }
+        }
       }
     }
 
@@ -147,11 +167,29 @@ export function runBacktest(opts: {
     peak = Math.max(peak, equity)
     maxDrawdown = Math.max(maxDrawdown, ((peak - equity) / peak) * 100)
     curve.push(equity)
+    equityBars.push(equity)
   }
 
   const last = series[series.length - 1]
   const endEquity = equityAt(last)
   const sells = trades > 0 ? Math.ceil(trades / 2) : 0
+
+  const barReturns: number[] = []
+  for (let i = 1; i < equityBars.length; i++) {
+    if (equityBars[i - 1] > 0) barReturns.push(equityBars[i] / equityBars[i - 1] - 1)
+  }
+  let sharpe: number | null = null
+  if (barReturns.length > 1) {
+    const mean = barReturns.reduce((a, b) => a + b, 0) / barReturns.length
+    const variance =
+      barReturns.reduce((acc, r) => acc + (r - mean) ** 2, 0) / (barReturns.length - 1)
+    const sd = Math.sqrt(variance)
+    if (sd > 0) sharpe = mean / sd
+  }
+  const avgR =
+    rMultiples.length > 0
+      ? rMultiples.reduce((a, b) => a + b, 0) / rMultiples.length
+      : null
 
   return {
     symbol: opts.symbol,
@@ -165,6 +203,9 @@ export function runBacktest(opts: {
     returnPct: ((endEquity - START_CASH) / START_CASH) * 100,
     buyHoldPct: ((last - series[WARMUP]) / series[WARMUP]) * 100,
     maxDrawdownPct: maxDrawdown,
+    sharpe,
+    profitFactor: grossLoss > 0 ? grossWin / grossLoss : null,
+    avgR,
     curve: downsample(curve),
   }
 }

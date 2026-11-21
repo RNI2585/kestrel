@@ -79,6 +79,22 @@ export default function BacktestPanel({ instrument, bot }: Props) {
               <dd className="down">−{result.maxDrawdownPct.toFixed(2)}%</dd>
             </div>
             <div>
+              <dt>Avg R</dt>
+              <dd className={(result.avgR ?? 0) >= 0 ? 'up' : 'down'}>
+                {result.avgR === null ? '—' : `${result.avgR >= 0 ? '+' : ''}${result.avgR.toFixed(2)}R`}
+              </dd>
+            </div>
+            <div>
+              <dt>Profit factor</dt>
+              <dd>
+                {result.profitFactor === null ? '—' : result.profitFactor.toFixed(2)}
+              </dd>
+            </div>
+            <div>
+              <dt>Sharpe / tick</dt>
+              <dd>{result.sharpe === null ? '—' : result.sharpe.toFixed(3)}</dd>
+            </div>
+            <div>
               <dt>End equity</dt>
               <dd>{money(result.endEquity)}</dd>
             </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   ASSET_CLASSES,
   CLASS_COLOR,
@@ -19,6 +19,7 @@ import {
   type StrategyId,
 } from './bot'
 import {
+  START_CASH,
   applyOrder,
   limitReached,
   startingPortfolio,
@@ -39,6 +40,16 @@ import {
   type BrokerConnection,
 } from './brokers'
 import { money, price as fmtPrice, signedPct } from './format'
+import {
+  clearProfile,
+  loadProfile,
+  loadSettings,
+  saveProfile,
+  saveSettings,
+  type Profile,
+  type Proposal,
+  type Settings,
+} from './settings'
 import type { MeridianApi, ScriptStep } from './scripts'
 import type { ChartPlan, PlanLevel } from './chartPlan'
 import Watchlist from './components/Watchlist'
@@ -54,6 +65,10 @@ import WorkingOrders from './components/WorkingOrders'
 import Brokers from './components/Brokers'
 import BacktestPanel from './components/BacktestPanel'
 import ScriptsPanel from './components/ScriptsPanel'
+import ScanPanel from './components/ScanPanel'
+import Proposals from './components/Proposals'
+import SettingsView from './components/SettingsView'
+import LoginScreen from './components/LoginScreen'
 
 const STORAGE_KEY = 'meridian.terminal.v1'
 
@@ -65,15 +80,69 @@ const RANGES = [
 
 type RangeId = (typeof RANGES)[number]['id']
 
-type ViewId = 'trade' | 'trades' | 'bot' | 'brokers' | 'scripts'
+type ViewId = 'trade' | 'scan' | 'trades' | 'bot' | 'brokers' | 'scripts' | 'settings'
 
 const VIEWS: { id: ViewId; label: string; short: string; hint: string }[] = [
-  { id: 'trade', label: 'Trade setup', short: 'Trade', hint: 'Chart & ticket' },
-  { id: 'trades', label: 'Current trades', short: 'Trades', hint: 'Positions & fills' },
-  { id: 'bot', label: 'Bot & backtest', short: 'Bot', hint: 'Strategy settings' },
-  { id: 'brokers', label: 'Broker connections', short: 'Brokers', hint: 'Venues & keys' },
+  { id: 'trade', label: 'Desk', short: 'Desk', hint: 'Chart & ticket' },
+  { id: 'scan', label: 'Scan', short: 'Scan', hint: 'Ranked signals' },
+  { id: 'trades', label: 'Trades', short: 'Trades', hint: 'Positions & fills' },
+  { id: 'bot', label: 'Test lab', short: 'Test', hint: 'Strategy & backtest' },
   { id: 'scripts', label: 'Scripts', short: 'Scripts', hint: 'Chart or plain English' },
+  { id: 'brokers', label: 'Brokers', short: 'Brokers', hint: 'Venues & keys' },
+  { id: 'settings', label: 'Setup', short: 'Setup', hint: 'Profile & approvals' },
 ]
+
+/** One compact stroke icon per tab, drawn to match the rest of the chrome. */
+const DOCK_ICONS: Record<ViewId, ReactNode> = {
+  trade: <polyline points="3 13 7 13 10 5.5 14 18.5 17 11 21 11" />,
+  scan: (
+    <>
+      <rect x="3" y="3" width="7" height="7" rx="1.5" />
+      <rect x="14" y="3" width="7" height="7" rx="1.5" />
+      <rect x="3" y="14" width="7" height="7" rx="1.5" />
+      <rect x="14" y="14" width="7" height="7" rx="1.5" />
+    </>
+  ),
+  trades: (
+    <>
+      <path d="M4 20V11" />
+      <path d="M10 20V4" />
+      <path d="M16 20v-6" />
+      <path d="M22 20H2" />
+    </>
+  ),
+  bot: (
+    <>
+      <path d="M9 3h6" />
+      <path d="M10 3v5l-4.7 7.8A3 3 0 0 0 7.9 21h8.2a3 3 0 0 0 2.6-5.2L14 8V3" />
+      <path d="M7.6 15h8.8" />
+    </>
+  ),
+  scripts: (
+    <>
+      <path d="m8.5 8-4.5 4 4.5 4" />
+      <path d="m15.5 8 4.5 4-4.5 4" />
+    </>
+  ),
+  brokers: (
+    <>
+      <path d="M9 3v6" />
+      <path d="M15 3v6" />
+      <path d="M6 9h12v3a6 6 0 0 1-12 0V9Z" />
+      <path d="M12 18v3" />
+    </>
+  ),
+  settings: (
+    <>
+      <path d="M4 7h9" />
+      <path d="M19 7h1" />
+      <circle cx="15.5" cy="7" r="2.2" />
+      <path d="M4 17h1" />
+      <path d="M11 17h9" />
+      <circle cx="8.5" cy="17" r="2.2" />
+    </>
+  ),
+}
 
 interface StoredState {
   portfolio: Portfolio
@@ -246,9 +315,53 @@ export default function App() {
   const [now, setNow] = useState(Date.now())
   const mainRef = useRef<HTMLElement | null>(null)
 
+  const [profile, setProfile] = useState<Profile | null>(loadProfile)
+  const [settings, setSettings] = useState<Settings>(loadSettings)
+  const settingsRef = useRef(settings)
+  const [proposals, setProposals] = useState<Proposal[]>([])
+  const proposalsRef = useRef(proposals)
+
   useEffect(() => {
     botRef.current = bot
   }, [bot])
+
+  useEffect(() => {
+    settingsRef.current = settings
+  }, [settings])
+
+  useEffect(() => {
+    proposalsRef.current = proposals
+  }, [proposals])
+
+  /**
+   * Parks the bot's signals in the approvals inbox. One pending proposal per
+   * market and direction at a time, so a repeated scan cannot stack duplicates.
+   */
+  const enqueueProposals = useCallback((intents: BotIntent[]) => {
+    setProposals((prev) => {
+      const fresh = intents
+        .filter(
+          (intent) =>
+            !prev.some(
+              (p) =>
+                p.status === 'pending' &&
+                p.symbol === intent.symbol &&
+                p.side === intent.side,
+            ),
+        )
+        .map<Proposal>((intent, i) => ({
+          id: `prop-${Date.now()}-${i}-${intent.symbol}`,
+          ts: Date.now(),
+          symbol: intent.symbol,
+          side: intent.side,
+          qty: intent.qty,
+          price: intent.price,
+          reason: intent.reason,
+          status: 'pending',
+        }))
+      return [...fresh, ...prev].slice(0, 20)
+    })
+  }, [])
 
   useEffect(() => {
     if (mainRef.current) mainRef.current.scrollTop = 0
@@ -338,7 +451,18 @@ export default function App() {
         const venue = botRef.current.routeToBroker
           ? brokersRef.current.find((b) => b.id === activeBrokerRef.current)
           : undefined
-        if (venue && venue.kind !== 'paper') {
+        if (settingsRef.current.requireApproval) {
+          // Approval mode: the scan only proposes, the trader decides.
+          const plan = runBotStep(
+            engine.instruments,
+            portfolioRef.current,
+            botRef.current,
+            cooldownsRef.current,
+            tickRef.current,
+            true,
+          )
+          if (plan.intents.length > 0) enqueueProposals(plan.intents)
+        } else if (venue && venue.kind !== 'paper') {
           if (!routingRef.current) {
             const plan = runBotStep(
               engine.instruments,
@@ -408,7 +532,7 @@ export default function App() {
       )
     }, 900)
     return () => window.clearInterval(id)
-  }, [engine, equityOf, dispatchBotIntents])
+  }, [engine, equityOf, dispatchBotIntents, enqueueProposals])
 
   useEffect(() => {
     try {
@@ -590,6 +714,51 @@ export default function App() {
     [placeOrder],
   )
 
+  /** Records a proposal's outcome with a line explaining it. */
+  const settleProposal = useCallback(
+    (id: string, status: Proposal['status'], note: string) => {
+      setProposals((prev) => prev.map((p) => (p.id === id ? { ...p, status, note } : p)))
+    },
+    [],
+  )
+
+  const skipProposal = useCallback(
+    (id: string) => settleProposal(id, 'skipped', 'Skipped by you'),
+    [settleProposal],
+  )
+
+  /**
+   * Books a proposal at the market, unless price has drifted past the retired
+   * threshold since the signal fired — then the setup is closed out instead.
+   */
+  const approveProposal = useCallback(
+    async (id: string) => {
+      const proposal = proposalsRef.current.find((p) => p.id === id)
+      if (!proposal || proposal.status !== 'pending') return
+      const ins = engine.get(proposal.symbol)
+      if (!ins) {
+        settleProposal(id, 'expired', 'Instrument unavailable')
+        return
+      }
+      const drift = Math.abs(ins.price / proposal.price - 1) * 100
+      if (drift > settingsRef.current.maxDriftPct) {
+        settleProposal(
+          id,
+          'expired',
+          `Price moved ${drift.toFixed(2)}% since the signal — setup retired`,
+        )
+        return
+      }
+      const result = await placeOrder(proposal.symbol, proposal.side, proposal.qty, 'market', 0)
+      settleProposal(
+        id,
+        result.ok ? 'approved' : 'expired',
+        result.ok ? `Filled at ${fmtPrice(ins.price, ins.dp)}` : result.error,
+      )
+    },
+    [engine, placeOrder, settleProposal],
+  )
+
   /** Applies generated script steps in order and reports what happened. */
   const runScript = useCallback(
     async (steps: ScriptStep[]): Promise<string[]> => {
@@ -765,10 +934,36 @@ export default function App() {
     setOrders([])
     ordersRef.current = []
     setEquitySeries([])
+    setProposals([])
     setBot((prev) => ({ ...prev, running: false }))
   }
 
   const updateBot = (patch: Partial<BotConfig>) => setBot((prev) => ({ ...prev, ...patch }))
+
+  const signIn = (next: Profile) => {
+    saveProfile(next)
+    setProfile(next)
+  }
+
+  const updateProfile = (next: Profile) => {
+    saveProfile(next)
+    setProfile(next)
+  }
+
+  const signOut = () => {
+    clearProfile()
+    setProfile(null)
+    setView('trade')
+  }
+
+  const changeSettings = (patch: Partial<Settings>) => {
+    setSettings((prev) => {
+      const next = { ...prev, ...patch }
+      saveSettings(next)
+      settingsRef.current = next
+      return next
+    })
+  }
 
   /** Puts a whole saved terminal in place, refs included, so the next tick sees it. */
   const applyState = (next: StoredState) => {
@@ -847,16 +1042,28 @@ export default function App() {
 
   const clock = new Date(now).toLocaleTimeString('en-GB', { hour12: false })
   const linkedBrokers = brokers.filter((b) => b.kind !== 'paper' && b.status === 'linked').length
-  const activeView = VIEWS.find((v) => v.id === view) ?? VIEWS[0]
+  const pendingCount = proposals.filter((p) => p.status === 'pending').length
+  const activeView = VIEWS.find((v) => v.id === view) ?? {
+    id: view,
+    label: 'Settings',
+    short: 'Settings',
+    hint: 'Profile & approvals',
+  }
+
+  if (!profile) return <LoginScreen onSubmit={signIn} />
 
   return (
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="brand__mark" aria-hidden="true" />
+          <span className="brand__mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="17" height="17">
+              <path d="M13 3 5 14h6l-1 7 8-11h-6Z" fill="currentColor" />
+            </svg>
+          </span>
           <div>
-            <div className="brand__name">Meridian</div>
-            <div className="brand__sub">Paper trading terminal</div>
+            <div className="brand__name">Kestrel</div>
+            <div className="brand__sub">Paper desk · Broker bridge</div>
           </div>
         </div>
         <div className="topbar__right">
@@ -868,7 +1075,34 @@ export default function App() {
             {activeBrokerConn.kind === 'paper' ? 'Simulated feed' : `${activeBrokerConn.label} linked`}
           </span>
           <span className="topbar__clock">{clock}</span>
-          <span className="topbar__equity">{money(equity)}</span>
+          <span className="topbar__equity-block">
+            <span className="topbar__equity-label">Equity · paper</span>
+            <strong className="topbar__equity">{money(equity)}</strong>
+            <span
+              className={`topbar__equity-delta ${equity >= portfolio.deposited ? 'up' : 'down'}`}
+            >
+              {signedPct(((equity - portfolio.deposited) / portfolio.deposited) * 100)} today
+            </span>
+          </span>
+          <button
+            className={`topbar__gear ${view === 'settings' ? 'is-active' : ''}`}
+            aria-label="Settings"
+            aria-pressed={view === 'settings'}
+            onClick={() => setView('settings')}
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <circle cx="12" cy="12" r="3.4" fill="none" stroke="currentColor" strokeWidth="1.6" />
+              <path
+                d="M19.2 13.6a7.6 7.6 0 0 0 0-3.2l1.7-1.2-1.7-3-1.9.8a7.4 7.4 0 0 0-2.7-1.6L14.3 3h-3.4l-.3 2.4A7.4 7.4 0 0 0 7.9 7l-1.9-.8-1.7 3 1.6 1.2a7.6 7.6 0 0 0 0 3.2L4.3 14.8l1.7 3 1.9-.8a7.4 7.4 0 0 0 2.7 1.6l.3 2.4h3.4l.3-2.4a7.4 7.4 0 0 0 2.7-1.6l1.9.8 1.7-3-1.7-1.2Z"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.3"
+                strokeLinejoin="round"
+              />
+            </svg>
+            <span className="topbar__gear-name">{profile.name.split(' ')[0]}</span>
+            {pendingCount > 0 && <span className="topbar__gear-dot" aria-hidden="true" />}
+          </button>
         </div>
       </header>
 
@@ -970,6 +1204,34 @@ export default function App() {
             </div>
           )}
 
+          {view === 'scan' && (
+            <ScanPanel
+              instruments={engine.instruments}
+              bot={bot}
+              tick={tickRef.current}
+              onOpen={(symbol) => {
+                setSelected(symbol)
+                setView('trade')
+              }}
+              onStrategy={(strategy) => updateBot({ strategy })}
+            />
+          )}
+
+          {view === 'settings' && (
+            <SettingsView
+              profile={profile}
+              settings={settings}
+              onChangeSettings={changeSettings}
+              onSaveProfile={updateProfile}
+              onSignOut={signOut}
+              onExport={exportState}
+              onImport={(file) => void importState(file)}
+              onReset={resetAccount}
+              equity={equity}
+              startingCash={START_CASH}
+            />
+          )}
+
           {view === 'trades' && (
             <div className="view">
               <div className="view__head">
@@ -992,14 +1254,17 @@ export default function App() {
                     portfolio={portfolio}
                     equity={equity}
                     unrealized={unrealized}
-                    onReset={resetAccount}
-                    onExport={exportState}
-                    onImport={(file) => void importState(file)}
+                    onOpenSettings={() => setView('settings')}
                   />
                   <Positions rows={holdingRows} onSelect={setSelected} />
                   <EquityCurve points={equitySeries} deposited={portfolio.deposited} equity={equity} />
                 </div>
                 <div className="stack">
+                  <Proposals
+                    proposals={proposals}
+                    onApprove={(id) => void approveProposal(id)}
+                    onSkip={skipProposal}
+                  />
                   <WorkingOrders orders={orders} onCancel={cancelOrder} onSelect={setSelected} />
                   <Activity fills={fills} onSelect={setSelected} />
                 </div>
@@ -1011,7 +1276,7 @@ export default function App() {
             <div className="view">
               <div className="view__head">
                 <div>
-                  <h1 className="view__title">Bot &amp; backtest</h1>
+                  <h1 className="view__title">Test lab</h1>
                   <p className="view__sub">
                     One strategy per run, tuned per symbol class, sized by risk.
                   </p>
@@ -1099,7 +1364,9 @@ export default function App() {
               ? holdingRows.length
               : item.id === 'brokers'
                 ? linkedBrokers
-                : 0
+                : item.id === 'settings'
+                  ? pendingCount
+                  : 0
           return (
             <button
               key={item.id}
@@ -1107,6 +1374,20 @@ export default function App() {
               aria-current={view === item.id}
               onClick={() => setView(item.id)}
             >
+              <span className="dock__icon" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  {DOCK_ICONS[item.id]}
+                </svg>
+              </span>
               <span className="dock__label dock__label--full">{item.label}</span>
               <span className="dock__label dock__label--short" aria-hidden="true">
                 {item.short}

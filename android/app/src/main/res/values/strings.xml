@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">Meridian</string>
-    <string name="title_activity_main">Meridian</string>
+    <string name="app_name">Kestrel</string>
+    <string name="title_activity_main">Kestrel</string>
     <string name="package_name">com.meridian.terminal</string>
     <string name="custom_url_scheme">com.meridian.terminal</string>
 </resources>
