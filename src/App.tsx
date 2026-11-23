@@ -11,6 +11,7 @@ import {
   DEFAULT_BOT,
   DEFAULT_RISK,
   STRATEGIES,
+  activeRisk,
   patchRisk,
   runBotStep,
   type BotConfig,
@@ -25,6 +26,7 @@ import {
   startingPortfolio,
   type Fill,
   type Holding,
+  type IndicatorReading,
   type OrderType,
   type Portfolio,
   type Side,
@@ -40,6 +42,7 @@ import {
   type BrokerConnection,
 } from './brokers'
 import { money, price as fmtPrice, signedPct } from './format'
+import { exitHit, exitsFrom, type ExitBook } from './exits'
 import {
   clearProfile,
   loadProfile,
@@ -50,14 +53,14 @@ import {
   type Proposal,
   type Settings,
 } from './settings'
-import type { MeridianApi, ScriptStep } from './scripts'
+import type { KestrelApi, ScriptStep } from './scripts'
 import type { ChartPlan, PlanLevel } from './chartPlan'
 import Watchlist from './components/Watchlist'
 import PriceChart from './components/PriceChart'
 import TradeTicket from './components/TradeTicket'
 import PositionCard from './components/PositionCard'
 import AccountPanel from './components/AccountPanel'
-import EquityCurve from './components/EquityCurve'
+import TradeLog from './components/TradeLog'
 import Positions from './components/Positions'
 import BotPanel from './components/BotPanel'
 import Activity from './components/Activity'
@@ -70,7 +73,9 @@ import Proposals from './components/Proposals'
 import SettingsView from './components/SettingsView'
 import LoginScreen from './components/LoginScreen'
 
-const STORAGE_KEY = 'meridian.terminal.v1'
+const STORAGE_KEY = 'kestrel.terminal.v1'
+/** The key written before the rename, read once so the account survives it. */
+const LEGACY_STORAGE_KEY = 'meridian.terminal.v1'
 
 const RANGES = [
   { id: '1H', points: 60 },
@@ -147,6 +152,8 @@ const DOCK_ICONS: Record<ViewId, ReactNode> = {
 interface StoredState {
   portfolio: Portfolio
   fills: Fill[]
+  /** A longer archive behind the trade log, so closed trades survive reloads. */
+  history: Fill[]
   bot: BotConfig
   orders: WorkingOrder[]
   equity: number[]
@@ -154,18 +161,22 @@ interface StoredState {
   activeBroker: string
   /** Venue the ticket picks for each asset class. */
   routes: Partial<Record<AssetClass, string>>
+  /** The stop and target each open position was taken with. */
+  exits: ExitBook
 }
 
 function emptyState(): StoredState {
   return {
     portfolio: startingPortfolio(),
     fills: [],
+    history: [],
     bot: DEFAULT_BOT,
     orders: [],
     equity: [],
     brokers: defaultConnections(),
     activeBroker: PAPER_BROKER_ID,
     routes: {},
+    exits: {},
   }
 }
 
@@ -249,16 +260,34 @@ function parseState(raw: string | null): StoredState | null {
         if (typeof id === 'string' && brokers.some((b) => b.id === id)) routes[cls] = id
       }
     }
+    const exits: ExitBook = {}
+    const storedExits = parsed.exits
+    if (storedExits && typeof storedExits === 'object') {
+      for (const [symbol, raw] of Object.entries(storedExits as Record<string, unknown>)) {
+        const level = raw as Partial<{ stopLoss: number; takeProfit: number }> | null
+        if (
+          level &&
+          typeof level.stopLoss === 'number' &&
+          typeof level.takeProfit === 'number' &&
+          Number.isFinite(level.stopLoss) &&
+          Number.isFinite(level.takeProfit)
+        ) {
+          exits[symbol] = { stopLoss: level.stopLoss, takeProfit: level.takeProfit }
+        }
+      }
+    }
 
     return {
       portfolio: { ...startingPortfolio(), ...portfolio },
       fills: Array.isArray(parsed.fills) ? parsed.fills.slice(0, 160) : [],
+      history: Array.isArray(parsed.history) ? parsed.history.slice(0, 1200) : [],
       bot: loadBot(parsed.bot),
       orders: Array.isArray(parsed.orders) ? parsed.orders.slice(0, 40) : [],
       equity: Array.isArray(parsed.equity) ? parsed.equity.slice(-240) : [],
       brokers,
       activeBroker,
       routes,
+      exits,
     }
   } catch {
     return null
@@ -266,7 +295,8 @@ function parseState(raw: string | null): StoredState | null {
 }
 
 function loadState(): StoredState {
-  return parseState(localStorage.getItem(STORAGE_KEY)) ?? emptyState()
+  return parseState(localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY)) ??
+    emptyState()
 }
 
 /** Backups never carry broker keys, so restored venues ask for them again. */
@@ -290,6 +320,7 @@ export default function App() {
   const [portfolio, setPortfolio] = useState<Portfolio>(initial.portfolio)
   const portfolioRef = useRef(portfolio)
   const [fills, setFills] = useState<Fill[]>(initial.fills)
+  const [tradeHistory, setTradeHistory] = useState<Fill[]>(initial.history)
   const [bot, setBot] = useState<BotConfig>(initial.bot)
   const botRef = useRef(bot)
   const cooldownsRef = useRef<Record<string, number>>({})
@@ -297,6 +328,8 @@ export default function App() {
 
   const [orders, setOrders] = useState<WorkingOrder[]>(initial.orders)
   const ordersRef = useRef(orders)
+  const [exits, setExits] = useState<ExitBook>(initial.exits)
+  const exitsRef = useRef(exits)
   const [equitySeries, setEquitySeries] = useState<number[]>(initial.equity)
   const [brokers, setBrokers] = useState<BrokerConnection[]>(initial.brokers)
   const brokersRef = useRef(brokers)
@@ -329,6 +362,18 @@ export default function App() {
     settingsRef.current = settings
   }, [settings])
 
+  // The visible fills only keep the newest 160. Every fill is also appended to
+  // the trade archive by id, so round trips survive long after they scroll out
+  // of the activity feed and across reloads.
+  useEffect(() => {
+    if (fills.length === 0) return
+    setTradeHistory((prev) => {
+      const seen = new Set(prev.map((f) => f.id))
+      const fresh = fills.filter((f) => !seen.has(f.id))
+      return fresh.length === 0 ? prev : [...fresh, ...prev].slice(0, 1200)
+    })
+  }, [fills])
+
   useEffect(() => {
     proposalsRef.current = proposals
   }, [proposals])
@@ -358,6 +403,8 @@ export default function App() {
           price: intent.price,
           reason: intent.reason,
           status: 'pending',
+          strategy: intent.strategy,
+          indicators: intent.indicators,
         }))
       return [...fresh, ...prev].slice(0, 20)
     })
@@ -374,6 +421,37 @@ export default function App() {
         (sum, [symbol, held]) => sum + held.qty * (engine.get(symbol)?.price ?? 0),
         0,
       ),
+    [engine],
+  )
+
+  /**
+   * Attaches the setup's stop and target to every position this batch of fills
+   * opened or added to, and forgets the exits of positions that closed. The
+   * levels are priced off the fill, so a re-entry starts from its own entry.
+   */
+  const syncExits = useCallback(
+    (pf: Portfolio, booked: Fill[]) => {
+      const next: ExitBook = { ...exitsRef.current }
+      const risk = activeRisk(botRef.current)
+      let changed = false
+      for (const fill of booked) {
+        const held = pf.holdings[fill.symbol]
+        if (!held) {
+          if (next[fill.symbol]) {
+            delete next[fill.symbol]
+            changed = true
+          }
+          continue
+        }
+        const ins = engine.get(fill.symbol)
+        if (fill.side !== 'buy' || !ins) continue
+        next[fill.symbol] = exitsFrom(held.avgCost, risk, ins.dp)
+        changed = true
+      }
+      if (!changed) return
+      exitsRef.current = next
+      setExits(next)
+    },
     [engine],
   )
 
@@ -415,12 +493,15 @@ export default function App() {
           source: 'bot',
           reason: `${intent.reason} · filled by ${conn.label}`,
           pnl: result.pnl,
+          strategy: intent.strategy,
+          indicators: intent.indicators,
         })
       }
       if (booked.length > 0) {
         portfolioRef.current = pf
         setPortfolio(pf)
         setFills((prev) => [...booked, ...prev].slice(0, 160))
+        syncExits(pf, booked)
       }
       if (lastMessage) {
         const next = brokersRef.current.map((b) =>
@@ -439,7 +520,7 @@ export default function App() {
     } finally {
       routingRef.current = false
     }
-  }, [])
+  }, [syncExits])
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -460,6 +541,7 @@ export default function App() {
             cooldownsRef.current,
             tickRef.current,
             true,
+            exitsRef.current,
           )
           if (plan.intents.length > 0) enqueueProposals(plan.intents)
         } else if (venue && venue.kind !== 'paper') {
@@ -471,6 +553,7 @@ export default function App() {
               cooldownsRef.current,
               tickRef.current,
               true,
+              exitsRef.current,
             )
             if (plan.intents.length > 0) void dispatchBotIntents(plan.intents, venue)
           }
@@ -481,11 +564,14 @@ export default function App() {
             botRef.current,
             cooldownsRef.current,
             tickRef.current,
+            false,
+            exitsRef.current,
           )
           if (result.fills.length > 0) {
             portfolioRef.current = result.portfolio
             setPortfolio(result.portfolio)
             setFills((prev) => [...result.fills, ...prev].slice(0, 160))
+            syncExits(result.portfolio, result.fills)
           }
         }
       }
@@ -521,6 +607,55 @@ export default function App() {
           portfolioRef.current = pf
           setPortfolio(pf)
           setFills((prev) => [...fillsNow, ...prev].slice(0, 160))
+          syncExits(pf, fillsNow)
+        }
+      }
+
+      // attached stops and targets: whatever opened the trade — the bot, a
+      // chart plan, a script or the ticket — it closes when either level hits
+      const book = exitsRef.current
+      if (Object.keys(book).length > 0) {
+        let pf = portfolioRef.current
+        const exitFills: Fill[] = []
+        let nextBook: ExitBook | null = null
+        for (const [symbol, exit] of Object.entries(book)) {
+          const held = pf.holdings[symbol]
+          const ins = engine.get(symbol)
+          if (!held || !ins) {
+            nextBook = { ...(nextBook ?? book) }
+            delete nextBook[symbol]
+            continue
+          }
+          const hit = exitHit(exit, ins.price)
+          if (!hit) continue
+          const result = applyOrder(pf, symbol, ins.price, 'sell', held.qty)
+          if (!result.ok) continue
+          pf = result.portfolio
+          nextBook = { ...(nextBook ?? book) }
+          delete nextBook[symbol]
+          exitFills.push({
+            id: `exit-${Date.now()}-${symbol}`,
+            ts: Date.now(),
+            symbol,
+            side: 'sell',
+            qty: held.qty,
+            price: ins.price,
+            source: 'manual',
+            reason:
+              hit === 'stop'
+                ? `Stop loss hit at ${fmtPrice(ins.price, ins.dp)}`
+                : `Take profit hit at ${fmtPrice(ins.price, ins.dp)}`,
+            pnl: result.pnl,
+          })
+        }
+        if (nextBook) {
+          exitsRef.current = nextBook
+          setExits(nextBook)
+        }
+        if (exitFills.length > 0) {
+          portfolioRef.current = pf
+          setPortfolio(pf)
+          setFills((prev) => [...exitFills, ...prev].slice(0, 160))
         }
       }
 
@@ -532,7 +667,7 @@ export default function App() {
       )
     }, 900)
     return () => window.clearInterval(id)
-  }, [engine, equityOf, dispatchBotIntents, enqueueProposals])
+  }, [engine, equityOf, dispatchBotIntents, enqueueProposals, syncExits])
 
   useEffect(() => {
     try {
@@ -541,18 +676,31 @@ export default function App() {
         JSON.stringify({
           portfolio,
           fills: fills.slice(0, 80),
+          history: tradeHistory.slice(0, 1200),
           bot,
           orders: orders.slice(0, 40),
           equity: equitySeries.slice(-240),
           brokers,
           activeBroker,
           routes,
+          exits,
         }),
       )
     } catch {
       // storage is a convenience; the terminal keeps running without it
     }
-  }, [portfolio, fills, bot, orders, equitySeries, brokers, activeBroker, routes])
+  }, [
+    portfolio,
+    fills,
+    tradeHistory,
+    bot,
+    orders,
+    equitySeries,
+    brokers,
+    activeBroker,
+    routes,
+    exits,
+  ])
 
   const instrument = engine.get(selected) ?? engine.instruments[0]
 
@@ -617,6 +765,8 @@ export default function App() {
       qty: number,
       type: OrderType,
       limit: number,
+      /** The setup behind a bot-approved proposal, kept with the fill. */
+      setup?: { strategy: StrategyId; indicators?: IndicatorReading[] },
     ): Promise<{ ok: true } | { ok: false; error: string }> => {
       const ins = engine.get(symbol)
       if (!ins) return { ok: false, error: `${symbol} is not a listed instrument.` }
@@ -671,32 +821,31 @@ export default function App() {
       const result = applyOrder(portfolioRef.current, ins.symbol, ins.price, side, qty)
       if (!result.ok) return result
 
+      const fill: Fill = {
+        id: `${Date.now()}-${ins.symbol}-${side}`,
+        ts: Date.now(),
+        symbol: ins.symbol,
+        side,
+        qty,
+        price: ins.price,
+        source: 'manual',
+        reason:
+          activeBrokerConn.kind === 'paper'
+            ? side === 'buy'
+              ? 'Market buy placed by you'
+              : 'Market sell placed by you'
+            : `Routed to ${activeBrokerConn.label}`,
+        pnl: result.pnl,
+        strategy: setup?.strategy,
+        indicators: setup?.indicators,
+      }
       portfolioRef.current = result.portfolio
       setPortfolio(result.portfolio)
-      setFills((prev) =>
-        [
-          {
-            id: `${Date.now()}-${ins.symbol}-${side}`,
-            ts: Date.now(),
-            symbol: ins.symbol,
-            side,
-            qty,
-            price: ins.price,
-            source: 'manual' as const,
-            reason:
-              activeBrokerConn.kind === 'paper'
-                ? side === 'buy'
-                  ? 'Market buy placed by you'
-                  : 'Market sell placed by you'
-                : `Routed to ${activeBrokerConn.label}`,
-            pnl: result.pnl,
-          },
-          ...prev,
-        ].slice(0, 160),
-      )
+      setFills((prev) => [fill, ...prev].slice(0, 160))
+      syncExits(result.portfolio, [fill])
       return { ok: true }
     },
-    [engine, activeBrokerConn],
+    [engine, activeBrokerConn, syncExits],
   )
 
   const submitOrder = useCallback(
@@ -749,7 +898,14 @@ export default function App() {
         )
         return
       }
-      const result = await placeOrder(proposal.symbol, proposal.side, proposal.qty, 'market', 0)
+      const result = await placeOrder(
+        proposal.symbol,
+        proposal.side,
+        proposal.qty,
+        'market',
+        0,
+        proposal.strategy ? { strategy: proposal.strategy, indicators: proposal.indicators } : undefined,
+      )
       settleProposal(
         id,
         result.ok ? 'approved' : 'expired',
@@ -841,7 +997,7 @@ export default function App() {
   )
 
   // The API generated scripts call, kept fresh through a ref.
-  const apiRef = useRef<MeridianApi | null>(null)
+  const apiRef = useRef<KestrelApi | null>(null)
   apiRef.current = {
     order: async (symbol, side, qty) => {
       const result = await placeOrder(symbol, side, qty, 'market', 0)
@@ -874,7 +1030,7 @@ export default function App() {
 
   useEffect(() => {
     const current = apiRef
-    const api: MeridianApi = {
+    const api: KestrelApi = {
       order: (symbol, side, qty) => current.current!.order(symbol, side, qty),
       limit: (symbol, side, qty, limitPrice) => current.current!.limit(symbol, side, qty, limitPrice),
       close: (symbol) => current.current!.close(symbol),
@@ -884,9 +1040,9 @@ export default function App() {
       risk: (patch) => current.current!.risk(patch),
       route: (target) => current.current!.route(target),
     }
-    window.meridian = api
+    window.kestrel = api
     return () => {
-      delete window.meridian
+      delete window.kestrel
     }
   }, [])
 
@@ -931,8 +1087,11 @@ export default function App() {
     cooldownsRef.current = {}
     setPortfolio(fresh)
     setFills([])
+    setTradeHistory([])
     setOrders([])
     ordersRef.current = []
+    exitsRef.current = {}
+    setExits({})
     setEquitySeries([])
     setProposals([])
     setBot((prev) => ({ ...prev, running: false }))
@@ -970,6 +1129,7 @@ export default function App() {
     portfolioRef.current = next.portfolio
     setPortfolio(next.portfolio)
     setFills(next.fills)
+    setTradeHistory(next.history)
     botRef.current = next.bot
     setBot(next.bot)
     ordersRef.current = next.orders
@@ -981,6 +1141,8 @@ export default function App() {
     setActiveBroker(next.activeBroker)
     routesRef.current = next.routes
     setRoutes(next.routes)
+    exitsRef.current = next.exits
+    setExits(next.exits)
     cooldownsRef.current = {}
   }
 
@@ -988,21 +1150,23 @@ export default function App() {
     const saved = withoutSecrets({
       portfolio,
       fills: fills.slice(0, 80),
+      history: tradeHistory.slice(0, 1200),
       bot,
       orders: orders.slice(0, 40),
       equity: equitySeries.slice(-240),
       brokers,
       activeBroker,
       routes,
+      exits,
     })
     const blob = new Blob(
-      [JSON.stringify({ app: 'meridian', version: 1, savedAt: new Date().toISOString(), state: saved }, null, 2)],
+      [JSON.stringify({ app: 'kestrel', version: 1, savedAt: new Date().toISOString(), state: saved }, null, 2)],
       { type: 'application/json' },
     )
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = `meridian-${new Date().toISOString().slice(0, 10)}.json`
+    link.download = `kestrel-${new Date().toISOString().slice(0, 10)}.json`
     link.click()
     URL.revokeObjectURL(url)
   }
@@ -1017,7 +1181,7 @@ export default function App() {
       next = null
     }
     if (!next) {
-      window.alert('That file is not a Meridian backup.')
+      window.alert('That file is not a Kestrel backup.')
       return
     }
     if (!window.confirm('Replace the current paper account with this backup?')) return
@@ -1026,6 +1190,18 @@ export default function App() {
 
   const change = changePct(instrument)
   const rangePoints = RANGES.find((r) => r.id === range)?.points ?? 160
+  const held = portfolio.holdings[instrument.symbol]
+  const attached = held ? exits[instrument.symbol] : undefined
+  const exitLevels: PlanLevel[] = attached
+    ? [
+        { label: 'Stop', price: attached.stopLoss, tone: 'stop' },
+        { label: 'Target', price: attached.takeProfit, tone: 'target' },
+      ]
+    : []
+  const chartLevels = [
+    ...(planLevels?.symbol === instrument.symbol ? planLevels.levels : []),
+    ...exitLevels,
+  ]
   const chartData = instrument.history.slice(-rangePoints)
   const high = Math.max(...chartData)
   const low = Math.min(...chartData)
@@ -1160,7 +1336,7 @@ export default function App() {
                   data={chartData}
                   color={CLASS_COLOR[instrument.cls]}
                   label={range}
-                  levels={planLevels?.symbol === instrument.symbol ? planLevels.levels : undefined}
+                  levels={chartLevels.length > 0 ? chartLevels : undefined}
                 />
 
                 <dl className="market__stats">
@@ -1242,7 +1418,7 @@ export default function App() {
                       ? `${holdingRows.length} open position${holdingRows.length === 1 ? '' : 's'}`
                       : 'No open positions'}
                     {' · '}
-                    {fills.length} fill{fills.length === 1 ? '' : 's'} this session
+                    {tradeHistory.length} fill{tradeHistory.length === 1 ? '' : 's'} logged
                   </p>
                 </div>
                 <span className="view__meta">{money(equity)}</span>
@@ -1257,7 +1433,11 @@ export default function App() {
                     onOpenSettings={() => setView('settings')}
                   />
                   <Positions rows={holdingRows} onSelect={setSelected} />
-                  <EquityCurve points={equitySeries} deposited={portfolio.deposited} equity={equity} />
+                  <TradeLog
+                    fills={tradeHistory}
+                    priceOf={(symbol) => engine.get(symbol)?.price}
+                    onSelect={setSelected}
+                  />
                 </div>
                 <div className="stack">
                   <Proposals

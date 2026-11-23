@@ -151,9 +151,10 @@ export default function ScanPanel({ instruments, bot, tick, onOpen, onStrategy }
       </div>
 
       <p className="scan__legend">
-        Score is the share of {STRATEGIES.length} strategies pointing the same way, from 0 (all
-        bearish) to 100 (all bullish). Hover or long-press a vote for the strategy's reason. Tap a
-        row to open it on the trade screen with its chart and ticket.
+        Score is the share of the strategies in scope pointing the same way, from 0 (all bearish)
+        to 100 (all bullish). The pip model only covers FX and crypto. Hover or long-press a vote
+        for the strategy's reason. Tap a row to open it on the trade screen with its chart and
+        ticket.
       </p>
 
       <section className="book" aria-labelledby="strategy-book-title">
@@ -161,8 +162,7 @@ export default function ScanPanel({ instruments, bot, tick, onOpen, onStrategy }
           <div>
             <h2 id="strategy-book-title">Strategy book</h2>
             <p>
-              All {STRATEGIES.length} models score every market above · arm one to hand it to the
-              bot.
+              Every model scores the markets it covers above · arm one to hand it to the bot.
             </p>
           </div>
           <span className="book__armed">Running {armed}</span>

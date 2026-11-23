@@ -1,9 +1,9 @@
 import type { PlanLevel } from '../chartPlan'
 
 const TONE: Record<PlanLevel['tone'], string> = {
-  entry: '#7FA7D9',
-  stop: '#E0685F',
-  target: '#5FBF8F',
+  entry: '#4da3ff',
+  stop: '#ff4d5e',
+  target: '#00c46a',
 }
 
 export default function PriceChart({
@@ -53,7 +53,7 @@ export default function PriceChart({
             x2={width}
             y1={height * f}
             y2={height * f}
-            stroke="#242b30"
+            stroke="#2f3136"
             strokeWidth="1"
             strokeDasharray="2 8"
             vectorEffect="non-scaling-stroke"
@@ -64,7 +64,7 @@ export default function PriceChart({
           x2={width}
           y1={y(first)}
           y2={y(first)}
-          stroke="#3d464b"
+          stroke="#3a3d43"
           strokeWidth="1"
           strokeDasharray="6 6"
           vectorEffect="non-scaling-stroke"

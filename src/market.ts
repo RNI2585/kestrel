@@ -3,11 +3,11 @@ export type AssetClass = 'Stocks' | 'Metals' | 'Crypto' | 'Fx' | 'Energy'
 export const ASSET_CLASSES: AssetClass[] = ['Stocks', 'Metals', 'Crypto', 'Fx', 'Energy']
 
 export const CLASS_COLOR: Record<AssetClass, string> = {
-  Stocks: '#7FA7D9',
-  Metals: '#C9A45B',
-  Crypto: '#A48BE8',
-  Fx: '#4FB9AE',
-  Energy: '#D98A5A',
+  Stocks: '#4da3ff',
+  Metals: '#00b24b',
+  Crypto: '#a48be8',
+  Fx: '#5fa8ff',
+  Energy: '#ffb020',
 }
 
 export interface Instrument {
@@ -118,4 +118,27 @@ export class MarketEngine {
 
 export function changePct(ins: Instrument): number {
   return ((ins.price - ins.prevClose) / ins.prevClose) * 100
+}
+
+/**
+ * The pip a market is quoted in. FX uses the conventional pip, with the yen
+ * pairs on 0.01. Crypto has no single standard, so the pip steps with the
+ * price tier to keep one pip a similar slice of the tape across coins.
+ */
+export function pipSize(priceValue: number, cls?: AssetClass): number {
+  const abs = Math.abs(priceValue)
+  if (cls === 'Fx') return abs > 10 ? 0.01 : 0.0001
+  if (abs >= 10_000) return 10
+  if (abs >= 1_000) return 1
+  if (abs >= 100) return 0.1
+  if (abs >= 10) return 0.01
+  if (abs >= 1) return 0.001
+  return 0.0001
+}
+
+/** A pip size shown the way the market quotes it. */
+export function pipLabel(step: number): string {
+  if (step >= 1) return step.toFixed(1)
+  if (step >= 0.01) return step.toFixed(2)
+  return step.toFixed(4)
 }

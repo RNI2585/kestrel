@@ -114,7 +114,7 @@ function ScriptResult({
 
           <p className="scripts__note">
             Runs against the paper account in this browser. The same code works from the console
-            through <code>window.meridian</code>; nothing here reaches a venue unless a broker is
+            through <code>window.kestrel</code>; nothing here reaches a venue unless a broker is
             routed.
           </p>
         </>

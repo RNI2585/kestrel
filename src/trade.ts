@@ -1,3 +1,5 @@
+import type { StrategyId } from './bot'
+
 export type Side = 'buy' | 'sell'
 export type OrderType = 'market' | 'limit'
 
@@ -13,6 +15,12 @@ export interface Portfolio {
   deposited: number
 }
 
+/** One indicator reading the setup saw when it fired. */
+export interface IndicatorReading {
+  label: string
+  value: string
+}
+
 export interface Fill {
   id: string
   ts: number
@@ -23,6 +31,10 @@ export interface Fill {
   source: 'bot' | 'manual'
   reason: string
   pnl?: number
+  /** The strategy that placed this fill, when the bot is the one trading. */
+  strategy?: StrategyId
+  /** The strategy's indicator values at the moment of the fill. */
+  indicators?: IndicatorReading[]
 }
 
 /** A resting order held by the terminal until the market trades through it. */

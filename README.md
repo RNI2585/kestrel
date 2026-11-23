@@ -1,4 +1,4 @@
-# Meridian — paper trading terminal
+# Kestrel — paper trading terminal
 
 A self-contained terminal for paper trading stocks, metals, FX, energy and crypto. Everything
 runs in the browser: the market feed is simulated locally, the account is a simulated ledger, and
@@ -62,14 +62,14 @@ A debug APK is signed with Android's debug key, which is fine for your own phone
 upload or a release file you would need a keystore:
 
 ```bash
-keytool -genkey -v -keystore meridian.jks -keyalg RSA -keysize 2048 -validity 10000 -alias meridian
+keytool -genkey -v -keystore kestrel.jks -keyalg RSA -keysize 2048 -validity 10000 -alias kestrel
 ```
 
 Add it under **Build → Generate Signed Bundle / APK**; keep the `.jks` file and its passwords out
 of the repo (`.gitignore` already excludes `*.jks` and `*.keystore`, but a committed key is still a
 leaked key).
 
-The launcher icon, round icon, adaptive icon layers and splash screens are Meridian's own branding
+The launcher icon, round icon, adaptive icon layers and splash screens are Kestrel's own branding
 (`android/app/src/main/res/mipmap-*` and `drawable-port-*` / `drawable-land-*`), drawn from the
 same three-bar mark as the web icons, so the installed app does not look like a Capacitor demo.
 
@@ -79,7 +79,7 @@ move an account between them with **Export / Import** in the Account panel.
 
 ## Your data
 
-- State lives in `this browser's localStorage` under `meridian.terminal.v1`, per origin. A copy
+- State lives in `this browser's localStorage` under `kestrel.terminal.v1`, per origin. (An account saved under the pre-rename key is read once and carried over.) A copy
   served from a different host or port is a separate account.
 - **Export / Import** in the Account panel writes the whole terminal — portfolio, fills, bot
   settings, working orders, equity history, broker list and per-class routing — to a JSON file and

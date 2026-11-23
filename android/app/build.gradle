@@ -1,10 +1,10 @@
 apply plugin: 'com.android.application'
 
 android {
-    namespace = "com.meridian.terminal"
+    namespace = "com.kestrel.terminal"
     compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "com.meridian.terminal"
+        applicationId "com.kestrel.terminal"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1

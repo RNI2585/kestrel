@@ -15,8 +15,8 @@ export interface ParsedScript {
   code: string
 }
 
-/** The small API an in-browser Meridian script can call. */
-export interface MeridianApi {
+/** The small API an in-browser Kestrel script can call. */
+export interface KestrelApi {
   order: (symbol: string, side: 'buy' | 'sell', qty: number) => Promise<void>
   limit: (symbol: string, side: 'buy' | 'sell', qty: number, price: number) => Promise<void>
   close: (symbol: string) => Promise<void>
@@ -29,7 +29,7 @@ export interface MeridianApi {
 
 declare global {
   interface Window {
-    meridian?: MeridianApi
+    kestrel?: KestrelApi
   }
 }
 
@@ -108,25 +108,25 @@ export function stepCode(step: ScriptStep): string {
   switch (step.kind) {
     case 'order':
       return step.limit
-        ? `await meridian.limit('${step.symbol}', '${step.side}', ${round(step.qty)}, ${step.limit})`
-        : `await meridian.order('${step.symbol}', '${step.side}', ${round(step.qty)})`
+        ? `await kestrel.limit('${step.symbol}', '${step.side}', ${round(step.qty)}, ${step.limit})`
+        : `await kestrel.order('${step.symbol}', '${step.side}', ${round(step.qty)})`
     case 'close':
-      return `await meridian.close('${step.symbol}')`
+      return `await kestrel.close('${step.symbol}')`
     case 'select':
-      return `meridian.select('${step.symbol}')`
+      return `kestrel.select('${step.symbol}')`
     case 'bot':
-      return `meridian.bot({ running: ${step.running} })`
+      return `kestrel.bot({ running: ${step.running} })`
     case 'strategy':
-      return `meridian.strategy('${step.strategy}')`
+      return `kestrel.strategy('${step.strategy}')`
     case 'risk': {
       const parts: string[] = []
       if (step.riskPct !== undefined) parts.push(`riskPct: ${step.riskPct}`)
       if (step.stopLossPct !== undefined) parts.push(`stopLossPct: ${step.stopLossPct}`)
       if (step.takeProfitPct !== undefined) parts.push(`takeProfitPct: ${step.takeProfitPct}`)
-      return `meridian.risk({ ${parts.join(', ')} })`
+      return `kestrel.risk({ ${parts.join(', ')} })`
     }
     case 'route':
-      return `meridian.route('${step.to}')`
+      return `kestrel.route('${step.to}')`
   }
 }
 
@@ -160,7 +160,7 @@ export function describeStep(step: ScriptStep): string {
 }
 
 /**
- * Turns a plain-English description into ordered Meridian steps plus the
+ * Turns a plain-English description into ordered Kestrel steps plus the
  * equivalent script. One clause is read at a time, so "buy 2 gold and start
  * the bot" becomes two steps; anything not understood is reported, never
  * executed.
@@ -300,7 +300,7 @@ export function parseScript(description: string, symbols: string[]): ParsedScrip
     merged.length === 0
       ? ''
       : [
-          '// Meridian script — generated from your description',
+          '// Kestrel script — generated from your description',
           '// Each line runs with the paper account in this browser.',
           ...merged.map(stepCode),
         ].join('\n')

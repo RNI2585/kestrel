@@ -1,5 +1,12 @@
-import { STRATEGIES, signalFor, tunedParams, type BotConfig, type StrategyId } from './bot'
-import { changePct, type AssetClass, type Instrument } from './market'
+import {
+  STRATEGIES,
+  signalFor,
+  tradesClass,
+  tunedParams,
+  type BotConfig,
+  type StrategyId,
+} from './bot'
+import { changePct, pipSize, type AssetClass, type Instrument } from './market'
 
 /** One strategy's read on one instrument, kept for the scan's vote column. */
 export interface Vote {
@@ -70,19 +77,24 @@ export function scanMarkets(
 
   for (const instrument of instruments) {
     if (filter !== 'All' && instrument.cls !== filter) continue
-    const votes: Vote[] = STRATEGIES.map((s) => {
-      const signalForStrategy = signalFor(s.id, instrument.history, bot.params[s.id])
-      return {
-        strategy: s.id,
-        name: s.name,
-        dir: signalForStrategy.dir,
-        // The armed strategy's note already reflects the bot's live tuning.
-        note:
-          s.id === bot.strategy
-            ? signalFor(s.id, instrument.history, tuning).note
-            : signalForStrategy.note,
-      }
-    })
+    const pip = pipSize(instrument.price, instrument.cls)
+    // The pip model only reads FX and crypto, so it stays out of the vote on
+    // markets it cannot trade rather than counting as a flat opinion.
+    const votes: Vote[] = STRATEGIES.filter((s) => tradesClass(s.id, instrument.cls)).map(
+      (s) => {
+        const signalForStrategy = signalFor(s.id, instrument.history, bot.params[s.id], pip)
+        return {
+          strategy: s.id,
+          name: s.name,
+          dir: signalForStrategy.dir,
+          // The armed strategy's note already reflects the bot's live tuning.
+          note:
+            s.id === bot.strategy
+              ? signalFor(s.id, instrument.history, tuning, pip).note
+              : signalForStrategy.note,
+        }
+      },
+    )
     const bulls = votes.filter((v) => v.dir > 0).length
     const bears = votes.filter((v) => v.dir < 0).length
     const score = Math.round(50 + ((bulls - bears) / votes.length) * 50)

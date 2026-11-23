@@ -4,11 +4,11 @@ import type { CapacitorConfig } from '@capacitor/cli'
 // `npm run build` must run before `cap sync`. No server URL is set: the app is
 // fully offline.
 const config: CapacitorConfig = {
-  appId: 'com.meridian.terminal',
-  appName: 'Meridian',
+  appId: 'com.kestrel.terminal',
+  appName: 'Kestrel',
   webDir: 'dist',
   android: {
-    backgroundColor: '#0f1214',
+    backgroundColor: '#141415',
   },
 }
 

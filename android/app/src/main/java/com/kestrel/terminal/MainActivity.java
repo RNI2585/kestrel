@@ -1,4 +1,4 @@
-package com.meridian.terminal;
+package com.kestrel.terminal;
 
 import com.getcapacitor.BridgeActivity;
 

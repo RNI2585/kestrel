@@ -1,4 +1,5 @@
 import { activeRisk, signalFor, tunedParams, withRisk, type BotConfig } from './bot'
+import { pipSize } from './market'
 import { applyOrder, START_CASH, startingPortfolio } from './trade'
 
 export interface BacktestAverages {
@@ -125,7 +126,7 @@ export function runBacktest(opts: {
     if (t < WARMUP) continue
     const price = series[t]
     const held = portfolio.holdings[opts.symbol]
-    const signal = signalFor(opts.cfg.strategy, history, tuning)
+    const signal = signalFor(opts.cfg.strategy, history, tuning, pipSize(price))
     let side: 'buy' | 'sell' | null = null
     let qty = 0
 

@@ -55,7 +55,7 @@ export default function Watchlist({ instruments, selected, filter, onFilter, onS
                   <span className="row__sym">{ins.symbol}</span>
                   <span className="row__name">{ins.name}</span>
                 </span>
-                <Sparkline data={ins.history.slice(-40)} color={chg >= 0 ? '#4FB58A' : '#E0685F'} />
+                <Sparkline data={ins.history.slice(-40)} color={chg >= 0 ? '#00c46a' : '#ff4d5e'} />
                 <span className="row__nums">
                   <span className="row__price">{price(ins.price, ins.dp)}</span>
                   <span className={chg >= 0 ? 'row__chg up' : 'row__chg down'}>

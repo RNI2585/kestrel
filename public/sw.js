@@ -1,10 +1,10 @@
 /*
- * Meridian runs entirely in the browser, so a thin cache is enough to make it
+ * Kestrel runs entirely in the browser, so a thin cache is enough to make it
  * work offline. Navigations try the network first (so a new build is picked up
  * as soon as the phone is online and the cached copy is only the fallback);
  * hashed build assets are served from the cache and never change.
  */
-const CACHE = 'meridian-shell-v1'
+const CACHE = 'kestrel-shell-v1'
 const SHELL = ['/', '/manifest.webmanifest', '/icons/icon-192.png']
 
 self.addEventListener('install', (event) => {

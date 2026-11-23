@@ -125,7 +125,7 @@ function BacktestCurve({ result, positive }: { result: BacktestResult; positive:
     .map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(2)},${y(v).toFixed(2)}`)
     .join(' ')
   const area = `${line} L${width},${height} L0,${height} Z`
-  const color = positive ? '#4fb58a' : '#e0685f'
+  const color = positive ? '#00c46a' : '#ff4d5e'
 
   return (
     <svg

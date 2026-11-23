@@ -2,6 +2,7 @@ import { useState } from 'react'
 import {
   DEFAULT_RISK,
   STRATEGIES,
+  STRATEGY_CLASSES,
   activeRisk,
   defaultParams,
   paramDefs,
@@ -117,6 +118,12 @@ export default function BotPanel({ bot, onChange, stats, instruments, brokerLabe
         </select>
       </label>
       <p className="hint">{strategy?.blurb}</p>
+      {STRATEGY_CLASSES[bot.strategy] && (
+        <p className="hint">
+          This strategy only trades {STRATEGY_CLASSES[bot.strategy]?.join(' and ')} — the bot skips
+          every other asset class while it is armed.
+        </p>
+      )}
 
       {defs.map((def) => (
         <Slider

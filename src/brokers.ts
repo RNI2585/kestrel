@@ -529,7 +529,7 @@ async function buildOrderRequest(
         symbol,
         side: order.side === 'buy' ? 'BUY' : 'SELL',
         qty,
-        clientOrderId: `meridian-${Date.now().toString(36)}`,
+        clientOrderId: `kestrel-${Date.now().toString(36)}`,
       })
     default:
       return {
@@ -546,7 +546,7 @@ async function buildOrderRequest(
             qty,
             type: 'market',
             time_in_force: 'day',
-            client_order_id: `meridian-${Date.now().toString(36)}`,
+            client_order_id: `kestrel-${Date.now().toString(36)}`,
             reference_price: order.price,
           }),
         },

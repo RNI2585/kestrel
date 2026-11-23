@@ -1,3 +1,6 @@
+import type { StrategyId } from './bot'
+import type { IndicatorReading } from './trade'
+
 /** The local profile the login screen creates. Nothing leaves the browser. */
 export interface Profile {
   name: string
@@ -20,8 +23,11 @@ export const DEFAULT_SETTINGS: Settings = {
   maxDriftPct: 0.4,
 }
 
-const SETTINGS_KEY = 'meridian.settings.v1'
-const PROFILE_KEY = 'meridian.profile.v1'
+const SETTINGS_KEY = 'kestrel.settings.v1'
+const PROFILE_KEY = 'kestrel.profile.v1'
+/** Keys written before the rename, read once so a saved profile survives it. */
+const LEGACY_SETTINGS_KEY = 'meridian.settings.v1'
+const LEGACY_PROFILE_KEY = 'meridian.profile.v1'
 
 function read(key: string): unknown {
   try {
@@ -33,7 +39,7 @@ function read(key: string): unknown {
 }
 
 export function loadSettings(): Settings {
-  const stored = read(SETTINGS_KEY)
+  const stored = read(SETTINGS_KEY) ?? read(LEGACY_SETTINGS_KEY)
   const source = stored && typeof stored === 'object' ? (stored as Partial<Settings>) : {}
   return {
     requireApproval:
@@ -56,7 +62,7 @@ export function saveSettings(settings: Settings): void {
 }
 
 export function loadProfile(): Profile | null {
-  const stored = read(PROFILE_KEY)
+  const stored = read(PROFILE_KEY) ?? read(LEGACY_PROFILE_KEY)
   if (!stored || typeof stored !== 'object') return null
   const source = stored as Partial<Profile>
   const name = typeof source.name === 'string' ? source.name.trim() : ''
@@ -96,4 +102,7 @@ export interface Proposal {
   reason: string
   status: 'pending' | 'approved' | 'skipped' | 'expired'
   note?: string
+  /** The strategy and its indicator readings when the signal fired. */
+  strategy?: StrategyId
+  indicators?: IndicatorReading[]
 }

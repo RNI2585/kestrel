@@ -1,5 +1,6 @@
-import type { AssetClass, Instrument } from './market'
-import { applyOrder, type Fill, type Portfolio } from './trade'
+import { pipLabel, pipSize, type AssetClass, type Instrument } from './market'
+import { applyOrder, type Fill, type IndicatorReading, type Portfolio } from './trade'
+import type { ExitBook } from './exits'
 
 export type StrategyId =
   | 'momentum'
@@ -9,6 +10,7 @@ export type StrategyId =
   | 'macd'
   | 'dip'
   | 'scalp'
+  | 'pips'
 
 /** The money settings that travel with a strategy. */
 export interface RiskSettings {
@@ -66,6 +68,7 @@ export const DEFAULT_RISK: Record<StrategyId, RiskSettings> = {
   macd: { riskPct: 4, stopLossPct: 2.5, takeProfitPct: 6 },
   dip: { riskPct: 3, stopLossPct: 3, takeProfitPct: 5 },
   scalp: { riskPct: 2, stopLossPct: 1, takeProfitPct: 2 },
+  pips: { riskPct: 3, stopLossPct: 1.2, takeProfitPct: 3 },
 }
 
 export const PARAM_DEFS: Record<StrategyId, ParamDef[]> = {
@@ -101,6 +104,11 @@ export const PARAM_DEFS: Record<StrategyId, ParamDef[]> = {
     { key: 'burst', label: 'Burst window', min: 2, max: 8, step: 1, value: 3, unit: ' ticks' },
     { key: 'punch', label: 'Punch threshold', min: 0.04, max: 0.5, step: 0.01, value: 0.12, unit: '%' },
     { key: 'fade', label: 'Cut when faded', min: 0.2, max: 1, step: 0.05, value: 0.5, unit: '× punch' },
+  ],
+  pips: [
+    { key: 'window', label: 'Range window', min: 20, max: 160, step: 4, value: 60, unit: ' ticks' },
+    { key: 'trigger', label: 'Breakout by', min: 2, max: 30, step: 1, value: 8, unit: ' pips' },
+    { key: 'fade', label: 'Cut when faded', min: 2, max: 20, step: 1, value: 6, unit: ' pips' },
   ],
 }
 
@@ -175,7 +183,28 @@ export const STRATEGIES: { id: StrategyId; name: string; blurb: string }[] = [
     blurb:
       'Buys a fast punch up over a few ticks and cuts the moment the punch fades, holding moments rather than trends.',
   },
+  {
+    id: 'pips',
+    name: 'Pip breakout',
+    blurb:
+      'FX and crypto only: buys a fresh high by a set number of pips and leaves once price fades the same way off that high.',
+  },
 ]
+
+/**
+ * Strategies that only make sense on some markets. The pip model works on
+ * currency and crypto quotes, where a pip is a known unit, and the bot skips
+ * every other class while it is armed.
+ */
+export const STRATEGY_CLASSES: Partial<Record<StrategyId, AssetClass[]>> = {
+  pips: ['Fx', 'Crypto'],
+}
+
+/** Whether a strategy trades this asset class at all. */
+export function tradesClass(strategy: StrategyId, cls: AssetClass): boolean {
+  const allowed = STRATEGY_CLASSES[strategy]
+  return !allowed || allowed.includes(cls)
+}
 
 const COOLDOWN_TICKS = 8
 /** Scalping is meant to trade often, so it rests a symbol for far fewer scans. */
@@ -250,6 +279,8 @@ export function signalFor(
   strategy: StrategyId,
   history: number[],
   tuning?: Record<string, number>,
+  /** The instrument's pip, so pip-denominated rules read the right unit. */
+  pip?: number,
 ): Signal {
   const p = { ...defaultParams(strategy), ...(tuning ?? {}) }
   const last = history[history.length - 1]
@@ -351,6 +382,28 @@ export function signalFor(
     return { dir: 0, note: `Tape ${move >= 0 ? '+' : ''}${move.toFixed(2)}% in ${burst} ticks` }
   }
 
+  if (strategy === 'pips') {
+    const look = Math.max(8, Math.round(p.window))
+    const step = pip ?? pipSize(last)
+    if (history.length < look + 1) return { dir: 0, note: 'Warming up' }
+    const window = history.slice(-look - 1, -1)
+    const high = Math.max(...window)
+    const low = Math.min(...window)
+    const above = (last - high) / step
+    const below = (low - last) / step
+    if (above >= p.trigger) {
+      return { dir: 1, note: `Pushed ${above.toFixed(1)} pips over the ${look}-tick high` }
+    }
+    if (below >= p.trigger) {
+      return { dir: -1, note: `Broke ${below.toFixed(1)} pips under the ${look}-tick low` }
+    }
+    const faded = (high - last) / step
+    if (faded >= p.fade) {
+      return { dir: -1, note: `Faded ${faded.toFixed(1)} pips off the ${look}-tick high` }
+    }
+    return { dir: 0, note: `${((last - low) / step).toFixed(1)} pips inside the ${look}-tick range` }
+  }
+
   const look = Math.max(8, Math.round(p.window))
   if (history.length < look + 1) return { dir: 0, note: 'Warming up' }
   const window = history.slice(-look - 1, -1)
@@ -361,6 +414,147 @@ export function signalFor(
   return { dir: 0, note: 'Inside the recent range' }
 }
 
+function reading(label: string, value: number): IndicatorReading {
+  const dp = Math.abs(value) >= 100 ? 2 : 4
+  return {
+    label,
+    value: value.toLocaleString('en-US', {
+      minimumFractionDigits: dp,
+      maximumFractionDigits: dp,
+    }),
+  }
+}
+
+function percentReading(label: string, value: number): IndicatorReading {
+  return { label, value: `${value >= 0 ? '+' : ''}${value.toFixed(2)}%` }
+}
+
+/**
+ * The values the strategy's indicators read right now. Captured with each
+ * trade so the log can show the setup a trade was taken on, not whatever the
+ * tape reads after the bot has moved on.
+ */
+export function indicatorReadings(
+  strategy: StrategyId,
+  history: number[],
+  tuning?: Record<string, number>,
+  /** The instrument's pip, so the chips are quoted the way the market is. */
+  pip?: number,
+): IndicatorReading[] {
+  const p = { ...defaultParams(strategy), ...(tuning ?? {}) }
+  const last = history[history.length - 1]
+  if (!Number.isFinite(last)) return []
+
+  if (strategy === 'momentum') {
+    const fastN = Math.max(2, Math.round(p.fast))
+    const slowN = Math.max(3, Math.round(p.slow))
+    const fast = sma(history, fastN)
+    const slow = slowN > fastN ? sma(history, slowN) : null
+    if (fast === null || slow === null) return []
+    return [
+      reading(`SMA(${fastN})`, fast),
+      reading(`SMA(${slowN})`, slow),
+      percentReading('Spread', ((fast - slow) / slow) * 100),
+    ]
+  }
+
+  if (strategy === 'meanrev') {
+    const n = Math.max(5, Math.round(p.window))
+    const mean = sma(history, n)
+    if (mean === null) return []
+    let variance = 0
+    for (let i = history.length - n; i < history.length; i++) variance += (history[i] - mean) ** 2
+    const sd = Math.sqrt(variance / n) || 1e-9
+    return [
+      reading(`Mean(${n})`, mean),
+      { label: 'Z-score', value: `${((last - mean) / sd).toFixed(2)}σ` },
+    ]
+  }
+
+  if (strategy === 'rsi') {
+    const period = Math.max(2, Math.round(p.period))
+    const value = rsi(history, period)
+    if (value === null) return []
+    return [
+      { label: `RSI(${period})`, value: value.toFixed(1) },
+      { label: 'Bands', value: `${p.low} / ${p.high}` },
+    ]
+  }
+
+  if (strategy === 'macd') {
+    const fastN = Math.max(2, Math.round(p.fast))
+    const slowN = Math.max(3, Math.round(p.slow))
+    const signalN = Math.max(2, Math.round(p.signal))
+    if (fastN >= slowN) return []
+    const fastEma = emaSeries(history, fastN)
+    const slowEma = emaSeries(history, slowN)
+    if (slowEma.length < signalN + 1) return []
+    const offset = slowN - fastN
+    const line = slowEma.map((value, i) => fastEma[i + offset] - value)
+    const signalEma = emaSeries(line, signalN)
+    if (signalEma.length === 0) return []
+    const macdNow = line[line.length - 1]
+    const signalNow = signalEma[signalEma.length - 1]
+    const hist = macdNow - signalNow
+    return [
+      reading(`MACD(${fastN},${slowN})`, macdNow),
+      reading(`Signal(${signalN})`, signalNow),
+      { label: 'Histogram', value: `${hist >= 0 ? '+' : ''}${hist.toFixed(4)}` },
+    ]
+  }
+
+  if (strategy === 'dip') {
+    const look = Math.max(8, Math.round(p.look))
+    if (history.length < look) return []
+    const high = Math.max(...history.slice(-look))
+    return [
+      reading(`High(${look})`, high),
+      percentReading('Dip', ((high - last) / high) * 100),
+    ]
+  }
+
+  if (strategy === 'scalp') {
+    const burst = Math.max(2, Math.round(p.burst))
+    if (history.length < burst + 1) return []
+    return [
+      percentReading(
+        `Move(${burst} ticks)`,
+        (last / history[history.length - 1 - burst] - 1) * 100,
+      ),
+      percentReading('Punch', p.punch),
+    ]
+  }
+
+  if (strategy === 'pips') {
+    const look = Math.max(8, Math.round(p.window))
+    const step = pip ?? pipSize(last)
+    if (history.length < look) return []
+    const window = history.slice(-look)
+    const high = Math.max(...window)
+    const low = Math.min(...window)
+    const start = Math.max(1, window.length - 20)
+    let moved = 0
+    for (let i = start; i < window.length; i++) moved += Math.abs(window[i] - window[i - 1])
+    const average = moved / Math.max(1, window.length - start) / step
+    return [
+      { label: 'Pip', value: pipLabel(step) },
+      { label: `Range(${look})`, value: `${((high - low) / step).toFixed(0)} pips` },
+      { label: 'Avg tick', value: `${average.toFixed(1)} pips` },
+    ]
+  }
+
+  const look = Math.max(8, Math.round(p.window))
+  if (history.length < look + 1) return []
+  const window = history.slice(-look - 1, -1)
+  const high = Math.max(...window)
+  const low = Math.min(...window)
+  return [
+    reading(`High(${look})`, high),
+    reading(`Low(${look})`, low),
+    percentReading('Range', ((high - low) / low) * 100),
+  ]
+}
+
 /** A trade the bot wants to make, handed to the caller to fill or route. */
 export interface BotIntent {
   symbol: string
@@ -368,6 +562,9 @@ export interface BotIntent {
   qty: number
   price: number
   reason: string
+  /** Strategy and indicator snapshot that produced the signal. */
+  strategy?: StrategyId
+  indicators?: IndicatorReading[]
 }
 
 export interface BotStepResult {
@@ -392,6 +589,7 @@ export function runBotStep(
   cooldowns: Record<string, number>,
   tick: number,
   route = false,
+  exits?: ExitBook,
 ): BotStepResult {
   let portfolio = start
   const fills: Fill[] = []
@@ -409,9 +607,11 @@ export function runBotStep(
 
   for (const ins of instruments) {
     if (!cfg.classes.includes(ins.cls)) continue
+    if (!tradesClass(cfg.strategy, ins.cls)) continue
     if (tick - (cooldowns[ins.symbol] ?? -999) < rest) continue
 
-    const signal = signalFor(cfg.strategy, ins.history, tuning)
+    const pip = pipSize(ins.price, ins.cls)
+    const signal = signalFor(cfg.strategy, ins.history, tuning, pip)
     const held = portfolio.holdings[ins.symbol]
     let side: 'buy' | 'sell' | null = null
     let qty = 0
@@ -419,11 +619,14 @@ export function runBotStep(
 
     if (held && held.qty > 1e-8) {
       const gain = (ins.price / held.avgCost - 1) * 100
-      if (gain <= -risk.stopLossPct) {
+      // A position taken with its own stop and target is exited by those
+      // levels, not by the risk settings of whatever strategy is armed now.
+      const guarded = Boolean(exits?.[ins.symbol])
+      if (!guarded && gain <= -risk.stopLossPct) {
         side = 'sell'
         qty = held.qty
         reason = `Stop loss at ${gain.toFixed(2)}%`
-      } else if (gain >= risk.takeProfitPct) {
+      } else if (!guarded && gain >= risk.takeProfitPct) {
         side = 'sell'
         qty = held.qty
         reason = `Take profit at +${gain.toFixed(2)}%`
@@ -447,8 +650,18 @@ export function runBotStep(
 
     cooldowns[ins.symbol] = tick
 
+    const readings = indicatorReadings(cfg.strategy, ins.history, tuning, pip)
+
     if (route) {
-      intents.push({ symbol: ins.symbol, side, qty, price: ins.price, reason })
+      intents.push({
+        symbol: ins.symbol,
+        side,
+        qty,
+        price: ins.price,
+        reason,
+        strategy: cfg.strategy,
+        indicators: readings,
+      })
       continue
     }
 
@@ -466,6 +679,8 @@ export function runBotStep(
       source: 'bot',
       reason,
       pnl: result.pnl,
+      strategy: cfg.strategy,
+      indicators: readings,
     })
   }
 

@@ -239,7 +239,7 @@ export function planFromChart(
       : []
 
   const code = [
-    `// Meridian chart plan — ${instrument.symbol} read from the visible chart`,
+    `// Kestrel chart plan — ${instrument.symbol} read from the visible chart`,
     `// bias ${bias} · RSI ${rsiValue.toFixed(1)} · ${atrPct.toFixed(2)}% bars · ${rangePct.toFixed(0)}% of range`,
     ...steps.map(stepCode),
   ].join('\n')
@@ -326,7 +326,7 @@ export function applyPlanExits(
     ` The exits and risk come from the best result of the sweep.`
 
   const code = [
-    `// Meridian chart plan — ${plan.read.symbol} read from the visible chart`,
+    `// Kestrel chart plan — ${plan.read.symbol} read from the visible chart`,
     `// exits from the best sweep combo: ${stopLossPct}% stop · ${takeProfitPct}% target · ${riskPct}% risk`,
     ...steps.map(stepCode),
   ].join('\n')
