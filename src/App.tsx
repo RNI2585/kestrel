@@ -11,8 +11,8 @@ import {
   DEFAULT_BOT,
   DEFAULT_RISK,
   STRATEGIES,
-  activeRisk,
   patchRisk,
+  riskFor,
   runBotStep,
   type BotConfig,
   type BotIntent,
@@ -69,6 +69,7 @@ import Brokers from './components/Brokers'
 import BacktestPanel from './components/BacktestPanel'
 import ScriptsPanel from './components/ScriptsPanel'
 import ScanPanel from './components/ScanPanel'
+import StrategiesTab from './components/StrategiesTab'
 import Proposals from './components/Proposals'
 import SettingsView from './components/SettingsView'
 import LoginScreen from './components/LoginScreen'
@@ -85,11 +86,20 @@ const RANGES = [
 
 type RangeId = (typeof RANGES)[number]['id']
 
-type ViewId = 'trade' | 'scan' | 'trades' | 'bot' | 'brokers' | 'scripts' | 'settings'
+type ViewId =
+  | 'trade'
+  | 'scan'
+  | 'strategies'
+  | 'trades'
+  | 'bot'
+  | 'brokers'
+  | 'scripts'
+  | 'settings'
 
 const VIEWS: { id: ViewId; label: string; short: string; hint: string }[] = [
   { id: 'trade', label: 'Desk', short: 'Desk', hint: 'Chart & ticket' },
   { id: 'scan', label: 'Scan', short: 'Scan', hint: 'Ranked signals' },
+  { id: 'strategies', label: 'Strategies', short: 'Models', hint: 'Models & indicators' },
   { id: 'trades', label: 'Trades', short: 'Trades', hint: 'Positions & fills' },
   { id: 'bot', label: 'Test lab', short: 'Test', hint: 'Strategy & backtest' },
   { id: 'scripts', label: 'Scripts', short: 'Scripts', hint: 'Chart or plain English' },
@@ -100,6 +110,14 @@ const VIEWS: { id: ViewId; label: string; short: string; hint: string }[] = [
 /** One compact stroke icon per tab, drawn to match the rest of the chrome. */
 const DOCK_ICONS: Record<ViewId, ReactNode> = {
   trade: <polyline points="3 13 7 13 10 5.5 14 18.5 17 11 21 11" />,
+  strategies: (
+    <>
+      <circle cx="12" cy="12" r="8.4" />
+      <circle cx="12" cy="12" r="3.2" />
+      <path d="M12 3.6v2.2" />
+      <path d="M12 18.2v2.2" />
+    </>
+  ),
   scan: (
     <>
       <rect x="3" y="3" width="7" height="7" rx="1.5" />
@@ -425,14 +443,15 @@ export default function App() {
   )
 
   /**
-   * Attaches the setup's stop and target to every position this batch of fills
-   * opened or added to, and forgets the exits of positions that closed. The
-   * levels are priced off the fill, so a re-entry starts from its own entry.
+   * Stamps the stop and target on a position when its opening fill is booked,
+   * using the settings of the strategy that opened it — the armed model for a
+   * manual trade, the proposal's model for an approved one. A target is set
+   * once per trade: adding to the position or arming another strategy never
+   * moves it, and a closed position forgets its levels.
    */
   const syncExits = useCallback(
     (pf: Portfolio, booked: Fill[]) => {
       const next: ExitBook = { ...exitsRef.current }
-      const risk = activeRisk(botRef.current)
       let changed = false
       for (const fill of booked) {
         const held = pf.holdings[fill.symbol]
@@ -445,6 +464,8 @@ export default function App() {
         }
         const ins = engine.get(fill.symbol)
         if (fill.side !== 'buy' || !ins) continue
+        if (next[fill.symbol]) continue
+        const risk = riskFor(botRef.current, fill.strategy ?? botRef.current.strategy)
         next[fill.symbol] = exitsFrom(held.avgCost, risk, ins.dp)
         changed = true
       }
@@ -1389,7 +1410,18 @@ export default function App() {
                 setSelected(symbol)
                 setView('trade')
               }}
-              onStrategy={(strategy) => updateBot({ strategy })}
+            />
+          )}
+
+          {view === 'strategies' && (
+            <StrategiesTab
+              bot={bot}
+              instruments={engine.instruments}
+              instrument={instrument}
+              exits={exits}
+              portfolio={portfolio}
+              tick={now}
+              onChange={updateBot}
             />
           )}
 

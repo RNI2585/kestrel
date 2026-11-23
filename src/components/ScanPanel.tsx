@@ -1,10 +1,5 @@
 import { useMemo, useState } from 'react'
-import {
-  DEFAULT_RISK,
-  STRATEGIES,
-  type BotConfig,
-  type StrategyId,
-} from '../bot'
+import { STRATEGIES, type BotConfig } from '../bot'
 import { ASSET_CLASSES, CLASS_COLOR, type AssetClass, type Instrument } from '../market'
 import { price as fmtPrice, signedPct } from '../format'
 import { scanMarkets } from '../scan'
@@ -15,15 +10,11 @@ interface Props {
   /** Changes on every market tick so the scan refreshes with the tape. */
   tick: number
   onOpen: (symbol: string) => void
-  /** Hands a strategy to the bot, so the scan's top pick can be traded. */
-  onStrategy: (id: StrategyId) => void
 }
 
 const ARROWS: Record<-1 | 0 | 1, string> = { 1: '▲', 0: '·', [-1]: '▼' }
 
-type Tally = { long: number; short: number; flat: number }
-
-export default function ScanPanel({ instruments, bot, tick, onOpen, onStrategy }: Props) {
+export default function ScanPanel({ instruments, bot, tick, onOpen }: Props) {
   const [filter, setFilter] = useState<AssetClass | 'All'>('All')
 
   const rows = useMemo(
@@ -32,20 +23,6 @@ export default function ScanPanel({ instruments, bot, tick, onOpen, onStrategy }
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [instruments, bot, filter, tick],
   )
-
-  const tallies = useMemo(() => {
-    const map = {} as Record<StrategyId, Tally>
-    for (const s of STRATEGIES) map[s.id] = { long: 0, short: 0, flat: 0 }
-    for (const row of rows) {
-      for (const vote of row.votes) {
-        const tally = map[vote.strategy]
-        if (vote.dir > 0) tally.long += 1
-        else if (vote.dir < 0) tally.short += 1
-        else tally.flat += 1
-      }
-    }
-    return map
-  }, [rows])
 
   const bullish = rows.filter((r) => r.bias === 'Bullish').length
   const bearish = rows.filter((r) => r.bias === 'Bearish').length
@@ -154,59 +131,8 @@ export default function ScanPanel({ instruments, bot, tick, onOpen, onStrategy }
         Score is the share of the strategies in scope pointing the same way, from 0 (all bearish)
         to 100 (all bullish). The pip model only covers FX and crypto. Hover or long-press a vote
         for the strategy's reason. Tap a row to open it on the trade screen with its chart and
-        ticket.
+        ticket. Arm a model and tune it in the Strategies tab.
       </p>
-
-      <section className="book" aria-labelledby="strategy-book-title">
-        <div className="book__head">
-          <div>
-            <h2 id="strategy-book-title">Strategy book</h2>
-            <p>
-              Every model scores the markets it covers above · arm one to hand it to the bot.
-            </p>
-          </div>
-          <span className="book__armed">Running {armed}</span>
-        </div>
-
-        <div className="book__grid">
-          {STRATEGIES.map((strategy, i) => {
-            const tally = tallies[strategy.id]
-            const risk = { ...DEFAULT_RISK[strategy.id], ...(bot.riskPrefs[strategy.id] ?? {}) }
-            const isArmed = bot.strategy === strategy.id
-            return (
-              <article
-                key={strategy.id}
-                className={isArmed ? 'strategy is-armed' : 'strategy'}
-              >
-                <div className="strategy__top">
-                  <span className="strategy__idx">{String(i + 1).padStart(2, '0')}</span>
-                  <span className="strategy__tag">{isArmed ? 'Armed' : strategy.id}</span>
-                </div>
-                <h3 className="strategy__name">{strategy.name}</h3>
-                <p className="strategy__blurb">{strategy.blurb}</p>
-                <div className="strategy__tape" aria-label={`Signals on this filter: ${tally.long} long, ${tally.short} short, ${tally.flat} flat`}>
-                  <span className="up">{tally.long}↑</span>
-                  <span className="down">{tally.short}↓</span>
-                  <span className="strategy__flat">{tally.flat}·</span>
-                </div>
-                <div className="strategy__foot">
-                  <span className="strategy__risk">
-                    {risk.riskPct}% risk · {risk.stopLossPct}% stop · {risk.takeProfitPct}% target
-                  </span>
-                  <button
-                    className={isArmed ? 'mini-btn mini-btn--on' : 'mini-btn'}
-                    onClick={() => onStrategy(strategy.id)}
-                    disabled={isArmed}
-                    aria-pressed={isArmed}
-                  >
-                    {isArmed ? 'Armed' : 'Arm'}
-                  </button>
-                </div>
-              </article>
-            )
-          })}
-        </div>
-      </section>
     </div>
   )
 }

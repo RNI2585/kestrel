@@ -128,9 +128,14 @@ export function tunedParams(cfg: BotConfig): Record<string, number> {
   return { ...defaultParams(cfg.strategy), ...(cfg.params[cfg.strategy] ?? {}) }
 }
 
+/** The risk, stop and target one strategy trades with. */
+export function riskFor(cfg: BotConfig, strategy: StrategyId): RiskSettings {
+  return { ...DEFAULT_RISK[strategy], ...(cfg.riskPrefs[strategy] ?? {}) }
+}
+
 /** The risk, stop and target the chosen strategy trades with. */
 export function activeRisk(cfg: BotConfig): RiskSettings {
-  return { ...DEFAULT_RISK[cfg.strategy], ...(cfg.riskPrefs[cfg.strategy] ?? {}) }
+  return riskFor(cfg, cfg.strategy)
 }
 
 /** Stores new exit settings against the chosen strategy. */

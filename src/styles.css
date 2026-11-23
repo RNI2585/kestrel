@@ -4669,3 +4669,132 @@ h3 {
     font-size: 21px;
   }
 }
+
+/* ---------- strategies & indicators ---------- */
+
+.indicators {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 16px 0;
+}
+
+.indicator {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2, #2b2d31);
+}
+
+.indicator__label {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.indicator__value {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--bone);
+  font-variant-numeric: tabular-nums;
+}
+
+.votes {
+  display: grid;
+  margin: 10px 16px 0;
+}
+
+.vote {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.vote:last-child {
+  border-bottom: 0;
+}
+
+.vote__name {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.vote__note {
+  margin-top: 2px;
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--faint);
+}
+
+.vote__dir {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.vote__dir.up {
+  color: var(--up);
+}
+
+.vote__dir.down {
+  color: var(--down);
+}
+
+.vote__dir.flat {
+  color: var(--faint);
+}
+
+.exits {
+  display: grid;
+  margin: 4px 16px 0;
+}
+
+.exit {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.exit:last-child {
+  border-bottom: 0;
+}
+
+.exit__sym {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--bone);
+}
+
+.exit__qty {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--faint);
+}
+
+.exit__levels {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.exit__levels .up {
+  color: var(--up);
+}
+
+.exit__levels .down {
+  color: var(--down);
+}
