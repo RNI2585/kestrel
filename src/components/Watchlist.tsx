@@ -23,7 +23,9 @@ export default function Watchlist({ instruments, selected, filter, onFilter, onS
     <div className="watch">
       <header className="watch__head">
         <h2>Watchlist</h2>
-        <span className="panel__meta">{visible.length} instruments</span>
+        <span className="panel__meta">
+          {visible.filter((i) => i.live).length} live · {visible.length} instruments
+        </span>
       </header>
 
       <div className="pills" role="group" aria-label="Filter by asset class">

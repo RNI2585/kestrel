@@ -1,5 +1,6 @@
 import { STRATEGIES } from '../bot'
 import { clockTime, price, signedMoney, signedPct, units } from '../format'
+import type { FillMatch } from '../match'
 import type { Fill, IndicatorReading } from '../trade'
 
 interface Props {
@@ -16,6 +17,7 @@ interface Lot {
   strategy?: string
   indicators: IndicatorReading[]
   note: string
+  match?: FillMatch
 }
 
 /** One round trip: a fill that opened a position and the fill that closed it. */
@@ -32,6 +34,8 @@ interface Trade {
   indicators: IndicatorReading[]
   entryNote: string
   exitNote?: string
+  /** The better-fitting model stamped on the fill when it was booked. */
+  match?: FillMatch
   open: boolean
 }
 
@@ -55,6 +59,7 @@ function buildTrades(fills: Fill[], priceOf: (symbol: string) => number | undefi
         strategy: fill.strategy,
         indicators: fill.indicators ?? [],
         note: fill.reason,
+        match: fill.match,
       })
       lots.set(fill.symbol, queue)
       continue
@@ -86,6 +91,7 @@ function buildTrades(fills: Fill[], priceOf: (symbol: string) => number | undefi
         indicators: lot.indicators.length > 0 ? lot.indicators : (fill.indicators ?? []),
         entryNote: lot.note,
         exitNote: fill.reason,
+        match: fill.match ?? lot.match,
         open: false,
       })
       lot.qty -= take
@@ -111,6 +117,7 @@ function buildTrades(fills: Fill[], priceOf: (symbol: string) => number | undefi
         indicators: fill.indicators ?? [],
         entryNote: 'Opening fill is older than the retained history',
         exitNote: fill.reason,
+        match: fill.match,
         open: false,
       })
     }
@@ -129,6 +136,7 @@ function buildTrades(fills: Fill[], priceOf: (symbol: string) => number | undefi
         strategy: lot.strategy,
         indicators: lot.indicators,
         entryNote: lot.note,
+        match: lot.match,
         open: true,
       })
     }
@@ -290,6 +298,24 @@ export default function TradeLog({ fills, priceOf, onSelect }: Props) {
                     {trade.entryNote}
                     {trade.exitNote ? ` · exit: ${trade.exitNote}` : ''}
                   </span>
+
+                  {trade.match && (
+                    <span
+                      className={`trade__match ${
+                        trade.match.verdict === 'Profitable'
+                          ? 'is-good'
+                          : trade.match.verdict === 'Risky'
+                            ? 'is-bad'
+                            : ''
+                      }`}
+                    >
+                      <span className="trade__match-head">
+                        Best fit · {trade.match.name} · {trade.match.score}/100 ·{' '}
+                        {trade.match.verdict}
+                      </span>
+                      <span className="trade__match-note">{trade.match.note}</span>
+                    </span>
+                  )}
                 </button>
               </li>
             )
@@ -299,7 +325,9 @@ export default function TradeLog({ fills, priceOf, onSelect }: Props) {
 
       <p className="trade__foot">
         Indicators are the readings captured when the setup fired, so each trade keeps the strategy
-        it was taken on even after the bot is re-armed. The log keeps the last 1,200 fills, so closed
+        it was taken on even after the bot is re-armed. Each fill is also matched against every
+        model that can trade it — the best read on the tape plus its record on this account — and
+        labelled profitable, a minor loss, or risky. The log keeps the last 1,200 fills, so closed
         trades survive a reload.
       </p>
     </section>

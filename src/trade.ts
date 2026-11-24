@@ -1,4 +1,5 @@
 import type { StrategyId } from './bot'
+import type { FillMatch } from './match'
 
 export type Side = 'buy' | 'sell'
 export type OrderType = 'market' | 'limit'
@@ -35,6 +36,8 @@ export interface Fill {
   strategy?: StrategyId
   /** The strategy's indicator values at the moment of the fill. */
   indicators?: IndicatorReading[]
+  /** The model that best explains this fill, stamped when it was booked. */
+  match?: FillMatch
 }
 
 /** A resting order held by the terminal until the market trades through it. */

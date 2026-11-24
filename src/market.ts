@@ -21,6 +21,21 @@ export interface Instrument {
   history: number[]
   vol: number
   base: number
+  /** True once a live quote feed has anchored this instrument. */
+  live?: boolean
+  /** The feed that last set the price, e.g. Coinbase. */
+  source?: string
+  /** When the live price was last applied. */
+  liveAt?: number
+}
+
+/** One live price a feed returns, already normalised to US dollars. */
+export interface QuoteUpdate {
+  price: number
+  /** The reference close the feed reports, when it has one. */
+  prevClose?: number
+  source: string
+  at: number
 }
 
 interface InstrumentDef {
@@ -100,6 +115,32 @@ export class MarketEngine {
 
   get(symbol: string): Instrument | undefined {
     return this.instruments.find((i) => i.symbol === symbol)
+  }
+
+  /**
+   * Anchors instruments to live quotes: the history is rescaled so the chart
+   * joins the real price, the day's reference close comes from the feed, and
+   * the simulation's drift then works around that price instead of its own.
+   * Returns how many instruments were updated.
+   */
+  applyLive(updates: Record<string, QuoteUpdate>): number {
+    let applied = 0
+    for (const ins of this.instruments) {
+      const quote = updates[ins.symbol]
+      if (!quote || !Number.isFinite(quote.price) || quote.price <= 0) continue
+      const ratio = quote.price / ins.price
+      if (!Number.isFinite(ratio) || ratio <= 0) continue
+      ins.history = ins.history.map((p) => p * ratio)
+      ins.prevClose =
+        quote.prevClose && quote.prevClose > 0 ? quote.prevClose : ins.prevClose * ratio
+      ins.price = quote.price
+      ins.base = quote.price
+      ins.live = true
+      ins.source = quote.source
+      ins.liveAt = quote.at
+      applied += 1
+    }
+    return applied
   }
 
   tick(): void {

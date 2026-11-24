@@ -41,8 +41,11 @@ import {
   venueSymbol,
   type BrokerConnection,
 } from './brokers'
-import { money, price as fmtPrice, signedPct } from './format'
+import { clockTime, money, price as fmtPrice, signedPct } from './format'
 import { exitHit, exitsFrom, type ExitBook } from './exits'
+import { fetchLiveQuotes } from './liveQuotes'
+import { matchFill, strategyRecords } from './match'
+import { parseEquity, type EquityPoint } from './timeline'
 import {
   clearProfile,
   loadProfile,
@@ -70,6 +73,7 @@ import BacktestPanel from './components/BacktestPanel'
 import ScriptsPanel from './components/ScriptsPanel'
 import ScanPanel from './components/ScanPanel'
 import StrategiesTab from './components/StrategiesTab'
+import PerformanceChart from './components/PerformanceChart'
 import Proposals from './components/Proposals'
 import SettingsView from './components/SettingsView'
 import LoginScreen from './components/LoginScreen'
@@ -174,7 +178,8 @@ interface StoredState {
   history: Fill[]
   bot: BotConfig
   orders: WorkingOrder[]
-  equity: number[]
+  /** Equity samples with the moment each was taken, for the session chart. */
+  equity: EquityPoint[]
   brokers: BrokerConnection[]
   activeBroker: string
   /** Venue the ticket picks for each asset class. */
@@ -301,7 +306,7 @@ function parseState(raw: string | null): StoredState | null {
       history: Array.isArray(parsed.history) ? parsed.history.slice(0, 1200) : [],
       bot: loadBot(parsed.bot),
       orders: Array.isArray(parsed.orders) ? parsed.orders.slice(0, 40) : [],
-      equity: Array.isArray(parsed.equity) ? parsed.equity.slice(-240) : [],
+      equity: parseEquity(parsed.equity),
       brokers,
       activeBroker,
       routes,
@@ -348,7 +353,14 @@ export default function App() {
   const ordersRef = useRef(orders)
   const [exits, setExits] = useState<ExitBook>(initial.exits)
   const exitsRef = useRef(exits)
-  const [equitySeries, setEquitySeries] = useState<number[]>(initial.equity)
+  const [equitySeries, setEquitySeries] = useState<EquityPoint[]>(initial.equity)
+  /** What the last live quote pull returned, so the header can say what is real. */
+  const [quoteFeed, setQuoteFeed] = useState<{
+    at: number
+    live: number
+    sources: { name: string; detail: string }[]
+    failed: string[]
+  }>({ at: 0, live: 0, sources: [], failed: [] })
   const [brokers, setBrokers] = useState<BrokerConnection[]>(initial.brokers)
   const brokersRef = useRef(brokers)
   const [activeBroker, setActiveBroker] = useState<string>(initial.activeBroker)
@@ -371,6 +383,31 @@ export default function App() {
   const settingsRef = useRef(settings)
   const [proposals, setProposals] = useState<Proposal[]>([])
   const proposalsRef = useRef(proposals)
+
+  // Live quotes: crypto from Coinbase, spot metals from gold-api and the daily
+  // FX fix from open.er-api, all key-less and open to the browser. Stocks and
+  // energy have no such feed, so they keep the simulated tape.
+  useEffect(() => {
+    let cancelled = false
+    const pull = async () => {
+      const snapshot = await fetchLiveQuotes()
+      if (cancelled) return
+      const applied = engine.applyLive(snapshot.quotes)
+      setQuoteFeed({
+        at: snapshot.at,
+        live: applied,
+        sources: snapshot.sources,
+        failed: snapshot.failed,
+      })
+      if (applied > 0) setNow(Date.now())
+    }
+    void pull()
+    const id = window.setInterval(() => void pull(), 60_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [engine])
 
   useEffect(() => {
     botRef.current = bot
@@ -476,6 +513,30 @@ export default function App() {
     [engine],
   )
 
+  const historyRef = useRef<Fill[]>(tradeHistory)
+  useEffect(() => {
+    historyRef.current = tradeHistory
+  }, [tradeHistory])
+
+  /**
+   * Stamps each fresh fill with the model that best explains it — the read on
+   * the tape at that moment plus that model's record on this account — so the
+   * log can mark it profitable, a minor loss or risky.
+   */
+  const withMatches = useCallback(
+    (booked: Fill[]) => {
+      if (booked.length === 0) return booked
+      const records = strategyRecords(historyRef.current)
+      return booked.map((fill) => {
+        if (fill.match) return fill
+        const ins = engine.get(fill.symbol)
+        if (!ins) return fill
+        return { ...fill, match: matchFill(ins, fill.side, botRef.current, records) }
+      })
+    },
+    [engine],
+  )
+
   /**
    * Sends the bot's proposed orders to the routed venue one by one and books
    * only the ones the venue accepts. One batch is in flight at a time so a slow
@@ -521,7 +582,7 @@ export default function App() {
       if (booked.length > 0) {
         portfolioRef.current = pf
         setPortfolio(pf)
-        setFills((prev) => [...booked, ...prev].slice(0, 160))
+        setFills((prev) => [...withMatches(booked), ...prev].slice(0, 160))
         syncExits(pf, booked)
       }
       if (lastMessage) {
@@ -541,7 +602,7 @@ export default function App() {
     } finally {
       routingRef.current = false
     }
-  }, [syncExits])
+  }, [syncExits, withMatches])
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -591,7 +652,7 @@ export default function App() {
           if (result.fills.length > 0) {
             portfolioRef.current = result.portfolio
             setPortfolio(result.portfolio)
-            setFills((prev) => [...result.fills, ...prev].slice(0, 160))
+            setFills((prev) => [...withMatches(result.fills), ...prev].slice(0, 160))
             syncExits(result.portfolio, result.fills)
           }
         }
@@ -627,7 +688,7 @@ export default function App() {
         if (fillsNow.length > 0) {
           portfolioRef.current = pf
           setPortfolio(pf)
-          setFills((prev) => [...fillsNow, ...prev].slice(0, 160))
+          setFills((prev) => [...withMatches(fillsNow), ...prev].slice(0, 160))
           syncExits(pf, fillsNow)
         }
       }
@@ -681,11 +742,12 @@ export default function App() {
       }
 
       const equityNow = equityOf(portfolioRef.current)
-      setEquitySeries((prev) =>
-        prev.length > 0 && Math.abs(prev[prev.length - 1] - equityNow) < 0.005
-          ? prev
-          : [...prev, equityNow].slice(-240),
-      )
+      const sampledAt = Date.now()
+      setEquitySeries((prev) => {
+        const lastPoint = prev[prev.length - 1]
+        if (lastPoint && Math.abs(lastPoint.v - equityNow) < 0.005) return prev
+        return [...prev, { t: sampledAt, v: equityNow }].slice(-1200)
+      })
     }, 900)
     return () => window.clearInterval(id)
   }, [engine, equityOf, dispatchBotIntents, enqueueProposals, syncExits])
@@ -700,7 +762,7 @@ export default function App() {
           history: tradeHistory.slice(0, 1200),
           bot,
           orders: orders.slice(0, 40),
-          equity: equitySeries.slice(-240),
+          equity: equitySeries.slice(-1200),
           brokers,
           activeBroker,
           routes,
@@ -741,6 +803,21 @@ export default function App() {
 
   const activeBrokerConn =
     brokers.find((b) => b.id === activeBrokerRef.current) ?? paperConnection()
+
+  /** What the last quote pull reached and what it could not, for the feed badge. */
+  const feedTitle = (() => {
+    if (quoteFeed.at === 0) return 'Waiting for the first live quote pull'
+    const lines = [`Pulled ${clockTime(quoteFeed.at)}`]
+    if (quoteFeed.sources.length > 0) {
+      lines.push(...quoteFeed.sources.map((s) => `${s.name} — ${s.detail}`))
+    }
+    if (quoteFeed.failed.length > 0) {
+      lines.push('Feed errors:', ...quoteFeed.failed.map((f) => `· ${f}`))
+    }
+    lines.push('Stocks and energy have no free key-less feed, so they stay simulated.')
+    return lines.join('\n')
+  })()
+  const feedFailed = quoteFeed.failed.length
 
   /**
    * Routes orders to a venue and remembers it for the asset class of the
@@ -862,11 +939,11 @@ export default function App() {
       }
       portfolioRef.current = result.portfolio
       setPortfolio(result.portfolio)
-      setFills((prev) => [fill, ...prev].slice(0, 160))
+      setFills((prev) => [...withMatches([fill]), ...prev].slice(0, 160))
       syncExits(result.portfolio, [fill])
       return { ok: true }
     },
-    [engine, activeBrokerConn, syncExits],
+    [engine, activeBrokerConn, syncExits, withMatches],
   )
 
   const submitOrder = useCallback(
@@ -1145,6 +1222,18 @@ export default function App() {
     })
   }
 
+  /** Auto execution runs the bot and books every signal without asking. */
+  const autoOn = bot.running && !settings.requireApproval
+  const toggleAutoExecute = () => {
+    if (autoOn) {
+      setBot((prev) => ({ ...prev, running: false }))
+      changeSettings({ requireApproval: true })
+      return
+    }
+    changeSettings({ requireApproval: false })
+    setBot((prev) => ({ ...prev, running: true }))
+  }
+
   /** Puts a whole saved terminal in place, refs included, so the next tick sees it. */
   const applyState = (next: StoredState) => {
     portfolioRef.current = next.portfolio
@@ -1210,6 +1299,7 @@ export default function App() {
   }
 
   const change = changePct(instrument)
+  const sessionStart = equitySeries[0]?.t ?? now
   const rangePoints = RANGES.find((r) => r.id === range)?.points ?? 160
   const held = portfolio.holdings[instrument.symbol]
   const attached = held ? exits[instrument.symbol] : undefined
@@ -1264,12 +1354,36 @@ export default function App() {
           </div>
         </div>
         <div className="topbar__right">
+          <button
+            className={`autoexec ${autoOn ? 'is-on' : ''}`}
+            onClick={toggleAutoExecute}
+            aria-pressed={autoOn}
+            title={
+              autoOn
+                ? 'Stop auto execution and go back to approving proposals'
+                : 'Run the bot and book every signal without asking'
+            }
+          >
+            <i aria-hidden="true" />
+            Auto execute
+          </button>
           <span className={`topbar__bot ${bot.running ? 'is-on' : ''}`}>
             <i aria-hidden="true" />
             {bot.running ? 'Bot scanning' : 'Bot paused'}
           </span>
-          <span className="topbar__badge">
-            {activeBrokerConn.kind === 'paper' ? 'Simulated feed' : `${activeBrokerConn.label} linked`}
+          <span
+            className={`topbar__badge${
+              feedFailed > 0 ? ' is-warn' : quoteFeed.live > 0 ? ' is-live' : ''
+            }`}
+            title={feedTitle}
+          >
+            {activeBrokerConn.kind === 'paper'
+              ? quoteFeed.live > 0
+                ? `${quoteFeed.live} live quotes${feedFailed > 0 ? ` · ${feedFailed} feed errors` : ''}`
+                : feedFailed > 0
+                  ? `${feedFailed} feed errors`
+                  : 'Simulated feed'
+              : `${activeBrokerConn.label} linked`}
           </span>
           <span className="topbar__clock">{clock}</span>
           <span className="topbar__equity-block">
@@ -1324,6 +1438,18 @@ export default function App() {
                       <span className="dot" style={{ background: CLASS_COLOR[instrument.cls] }} />
                       <span>{instrument.cls}</span>
                       <span className="market__name">{instrument.name}</span>
+                      <span
+                        className={instrument.live ? 'market__feed is-live' : 'market__feed'}
+                        title={
+                          instrument.live
+                            ? `${instrument.source} · updated ${clockTime(
+                                instrument.liveAt ?? now,
+                              )}`
+                            : 'No free key-less feed for this market — the tape is simulated'
+                        }
+                      >
+                        {instrument.live ? `Live · ${instrument.source}` : 'Simulated'}
+                      </span>
                     </div>
                     <h1>{instrument.symbol}</h1>
                   </div>
@@ -1458,6 +1584,20 @@ export default function App() {
 
               <div className="trades-grid">
                 <div className="stack">
+                  <section className="panel">
+                    <header className="panel__head">
+                      <h2>Trade performance</h2>
+                      <span className="panel__meta">
+                        session from {clockTime(sessionStart)} · {equitySeries.length} samples
+                      </span>
+                    </header>
+                    <PerformanceChart
+                      points={equitySeries}
+                      fills={tradeHistory}
+                      startTs={sessionStart}
+                      deposited={portfolio.deposited}
+                    />
+                  </section>
                   <AccountPanel
                     portfolio={portfolio}
                     equity={equity}
