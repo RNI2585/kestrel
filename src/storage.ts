@@ -15,15 +15,18 @@ import {
   type WorkingOrder,
 } from './trade'
 import { parseEquity, type EquityPoint } from './timeline'
-import { AUDIT_LIMIT, type AuditEvent } from './audit'
+import { AUDIT_LIMIT, type AuditEvent, type AuditKind } from './audit'
 import type { ExitBook } from './exits'
+import type { FillMatch } from './match'
 import {
   DEFAULT_BOT,
   DEFAULT_RISK,
+  PARAM_DEFS,
   STRATEGIES,
   type BotConfig,
   type RiskSettings,
   type StrategyId,
+  type StrategyParams,
 } from './bot'
 import { newDayAnchor, type DayAnchor } from './risk'
 
@@ -57,11 +60,13 @@ export interface StoredState {
   governor: DayAnchor
 }
 
-const STORAGE_KEY = 'kestrel.terminal.v1'
+export const DESK_STORAGE_KEY = 'kestrel.terminal.v1'
 /** A rolling snapshot, kept so a corrupt or half-written save cannot lose the desk. */
 const STORAGE_BACKUP_KEY = 'kestrel.terminal.backup.v1'
 /** The key written before the rename, read once so the account survives it. */
 const LEGACY_STORAGE_KEY = 'meridian.terminal.v1'
+export const MAX_BACKUP_SIZE = 5_000_000
+const MAX_SAVE_CHARS = MAX_BACKUP_SIZE
 
 function emptyState(): StoredState {
   return {
@@ -80,23 +85,153 @@ function emptyState(): StoredState {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function boundedNumber(value: unknown, fallback: number, min: number, max: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value))
+    : fallback
+}
+
+function parseIndicators(raw: unknown): Fill['indicators'] {
+  if (!Array.isArray(raw)) return undefined
+  const readings = raw.slice(0, 32).filter(
+    (item): item is { label: string; value: string } =>
+      isRecord(item) &&
+      typeof item.label === 'string' &&
+      item.label.length <= 100 &&
+      typeof item.value === 'string' &&
+      item.value.length <= 200,
+  )
+  return readings
+}
+
+function parseFill(raw: unknown): Fill | null {
+  if (
+    !isRecord(raw) ||
+    typeof raw.id !== 'string' ||
+    raw.id.length === 0 ||
+    raw.id.length > 200 ||
+    typeof raw.ts !== 'number' ||
+    !Number.isFinite(raw.ts) ||
+    typeof raw.symbol !== 'string' ||
+    raw.symbol.length === 0 ||
+    raw.symbol.length > 32 ||
+    (raw.side !== 'buy' && raw.side !== 'sell') ||
+    typeof raw.qty !== 'number' ||
+    !Number.isFinite(raw.qty) ||
+    raw.qty <= 0 ||
+    typeof raw.price !== 'number' ||
+    !Number.isFinite(raw.price) ||
+    raw.price <= 0 ||
+    (raw.source !== 'bot' && raw.source !== 'manual') ||
+    typeof raw.reason !== 'string' ||
+    raw.reason.length > 2000
+  ) {
+    return null
+  }
+  const fill: Fill = {
+    id: raw.id,
+    ts: raw.ts,
+    symbol: raw.symbol,
+    side: raw.side,
+    qty: raw.qty,
+    price: raw.price,
+    source: raw.source,
+    reason: raw.reason,
+  }
+  if (typeof raw.pnl === 'number' && Number.isFinite(raw.pnl)) fill.pnl = raw.pnl
+  if (STRATEGIES.some((strategy) => strategy.id === raw.strategy)) {
+    fill.strategy = raw.strategy as StrategyId
+  }
+  fill.indicators = parseIndicators(raw.indicators)
+
+  const match = raw.match
+  if (
+    isRecord(match) &&
+    STRATEGIES.some((strategy) => strategy.id === match.strategy) &&
+    typeof match.name === 'string' &&
+    match.name.length <= 100 &&
+    typeof match.score === 'number' &&
+    Number.isFinite(match.score) &&
+    match.score >= 0 &&
+    match.score <= 100 &&
+    (match.verdict === 'Profitable' ||
+      match.verdict === 'Minor loss' ||
+      match.verdict === 'Risky') &&
+    typeof match.note === 'string' &&
+    match.note.length <= 2000
+  ) {
+    const safeMatch: FillMatch = {
+      strategy: match.strategy as StrategyId,
+      name: match.name,
+      score: match.score,
+      verdict: match.verdict,
+      note: match.note,
+      indicators: parseIndicators(match.indicators),
+    }
+    fill.match = safeMatch
+  }
+  return fill
+}
+
+function parseFills(raw: unknown, limit: number): Fill[] {
+  if (!Array.isArray(raw)) return []
+  return raw.slice(0, limit).map(parseFill).filter((fill): fill is Fill => fill !== null)
+}
+
+function parseOrders(raw: unknown): WorkingOrder[] {
+  if (!Array.isArray(raw)) return []
+  return raw.slice(0, 40).filter(
+    (item): item is WorkingOrder =>
+      isRecord(item) &&
+      typeof item.id === 'string' &&
+      item.id.length > 0 &&
+      item.id.length <= 200 &&
+      typeof item.ts === 'number' &&
+      Number.isFinite(item.ts) &&
+      typeof item.symbol === 'string' &&
+      item.symbol.length > 0 &&
+      item.symbol.length <= 32 &&
+      (item.side === 'buy' || item.side === 'sell') &&
+      typeof item.qty === 'number' &&
+      Number.isFinite(item.qty) &&
+      item.qty > 0 &&
+      typeof item.limit === 'number' &&
+      Number.isFinite(item.limit) &&
+      item.limit > 0 &&
+      (item.status === 'working' || item.status === 'filled' || item.status === 'cancelled') &&
+      typeof item.broker === 'string' &&
+      item.broker.length <= 100 &&
+      typeof item.note === 'string' &&
+      item.note.length <= 2000,
+  )
+}
+
 /**
  * Rebuilds the bot config. Saves from before per-strategy exits held one shared
  * set, which is kept with the strategy that was armed at the time.
  */
 export function loadBot(raw: unknown): BotConfig {
-  const stored = (raw && typeof raw === 'object' ? raw : {}) as Partial<BotConfig> &
-    Partial<RiskSettings>
+  const stored = (isRecord(raw) ? raw : {}) as Partial<BotConfig> & Partial<RiskSettings>
   const strategy = STRATEGIES.some((s) => s.id === stored.strategy)
     ? (stored.strategy as StrategyId)
     : DEFAULT_BOT.strategy
 
   const riskPrefs: Partial<Record<StrategyId, RiskSettings>> = {}
-  const savedPrefs = stored.riskPrefs
-  if (savedPrefs && typeof savedPrefs === 'object') {
+  const savedPrefs = isRecord(stored.riskPrefs) ? stored.riskPrefs : {}
+  if (Object.keys(savedPrefs).length > 0) {
     for (const s of STRATEGIES) {
       const saved = savedPrefs[s.id]
-      if (saved) riskPrefs[s.id] = { ...DEFAULT_RISK[s.id], ...saved }
+      if (!isRecord(saved)) continue
+      const defaults = DEFAULT_RISK[s.id]
+      riskPrefs[s.id] = {
+        riskPct: boundedNumber(saved.riskPct, defaults.riskPct, 1, 10),
+        stopLossPct: boundedNumber(saved.stopLossPct, defaults.stopLossPct, 1, 10),
+        takeProfitPct: boundedNumber(saved.takeProfitPct, defaults.takeProfitPct, 2, 25),
+      }
     }
   }
   if (
@@ -107,24 +242,46 @@ export function loadBot(raw: unknown): BotConfig {
   ) {
     riskPrefs[strategy] = {
       ...DEFAULT_RISK[strategy],
-      ...(typeof stored.riskPct === 'number' ? { riskPct: stored.riskPct } : {}),
-      ...(typeof stored.stopLossPct === 'number' ? { stopLossPct: stored.stopLossPct } : {}),
-      ...(typeof stored.takeProfitPct === 'number'
-        ? { takeProfitPct: stored.takeProfitPct }
-        : {}),
+      riskPct: boundedNumber(stored.riskPct, DEFAULT_RISK[strategy].riskPct, 1, 10),
+      stopLossPct: boundedNumber(
+        stored.stopLossPct,
+        DEFAULT_RISK[strategy].stopLossPct,
+        1,
+        10,
+      ),
+      takeProfitPct: boundedNumber(
+        stored.takeProfitPct,
+        DEFAULT_RISK[strategy].takeProfitPct,
+        2,
+        25,
+      ),
     }
+  }
+
+  const params: StrategyParams = {}
+  const savedParams = isRecord(stored.params) ? stored.params : {}
+  for (const s of STRATEGIES) {
+    const values = savedParams[s.id]
+    if (!isRecord(values)) continue
+    const safe: Record<string, number> = {}
+    for (const def of PARAM_DEFS[s.id]) {
+      const value = values[def.key]
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        safe[def.key] = Math.min(def.max, Math.max(def.min, value))
+      }
+    }
+    if (Object.keys(safe).length > 0) params[s.id] = safe
   }
 
   return {
     ...DEFAULT_BOT,
     running: stored.running === true,
     strategy,
-    maxAllocPct:
-      typeof stored.maxAllocPct === 'number' ? stored.maxAllocPct : DEFAULT_BOT.maxAllocPct,
+    maxAllocPct: boundedNumber(stored.maxAllocPct, DEFAULT_BOT.maxAllocPct, 20, 100),
     classes: Array.isArray(stored.classes)
       ? stored.classes.filter((c): c is AssetClass => ASSET_CLASSES.includes(c))
       : DEFAULT_BOT.classes,
-    params: { ...(stored.params ?? {}) },
+    params,
     routeToBroker: stored.routeToBroker === true,
     riskPrefs,
   }
@@ -135,26 +292,113 @@ export function loadBot(raw: unknown): BotConfig {
  * backup file. Returns null when the text is not a usable save.
  */
 export function parseState(raw: string | null): StoredState | null {
-  if (!raw) return null
+  if (!raw || raw.length > MAX_SAVE_CHARS) return null
   try {
     const parsed = JSON.parse(raw) as Partial<StoredState>
     const portfolio = parsed.portfolio
-    if (!portfolio || typeof portfolio.cash !== 'number' || typeof portfolio.holdings !== 'object') {
+    if (
+      !portfolio ||
+      typeof portfolio.cash !== 'number' ||
+      !Number.isFinite(portfolio.cash) ||
+      portfolio.cash < 0 ||
+      !portfolio.holdings ||
+      typeof portfolio.holdings !== 'object' ||
+      Array.isArray(portfolio.holdings)
+    ) {
       return null
     }
-    const brokers = Array.isArray(parsed.brokers)
-      ? parsed.brokers.filter(
-          (b): b is BrokerConnection =>
-            !!b && BROKER_DEFS.some((d) => d.kind === (b as BrokerConnection).kind),
-        )
-      : []
-    if (!brokers.some((b) => b.kind === 'paper')) brokers.unshift(paperConnection())
+    const holdings: Record<string, Holding> = Object.create(null)
+    for (const [symbol, rawHolding] of Object.entries(portfolio.holdings)) {
+      if (
+        !rawHolding ||
+        typeof rawHolding !== 'object' ||
+        typeof rawHolding.qty !== 'number' ||
+        !Number.isFinite(rawHolding.qty) ||
+        rawHolding.qty <= 0 ||
+        typeof rawHolding.avgCost !== 'number' ||
+        !Number.isFinite(rawHolding.avgCost) ||
+        rawHolding.avgCost <= 0
+      ) {
+        return null
+      }
+      holdings[symbol] = { qty: rawHolding.qty, avgCost: rawHolding.avgCost }
+    }
+    const realized = portfolio.realized ?? 0
+    const deposited = portfolio.deposited ?? START_CASH
+    if (
+      typeof realized !== 'number' ||
+      !Number.isFinite(realized) ||
+      typeof deposited !== 'number' ||
+      !Number.isFinite(deposited) ||
+      deposited <= 0
+    ) {
+      return null
+    }
+    const safePortfolio: Portfolio = {
+      ...startingPortfolio(),
+      cash: portfolio.cash,
+      holdings,
+      realized,
+      deposited,
+    }
+    const brokers: BrokerConnection[] = [paperConnection()]
+    const brokerKinds = new Set<string>(['paper'])
+    const brokerIds = new Set<string>([PAPER_BROKER_ID])
+    if (Array.isArray(parsed.brokers)) {
+      for (const rawBroker of parsed.brokers) {
+        if (!isRecord(rawBroker)) continue
+        const def = BROKER_DEFS.find((candidate) => candidate.kind === rawBroker.kind)
+        if (
+          !def ||
+          def.kind === 'paper' ||
+          brokerKinds.has(def.kind) ||
+          typeof rawBroker.id !== 'string' ||
+          rawBroker.id.length === 0 ||
+          rawBroker.id.length > 120 ||
+          brokerIds.has(rawBroker.id) ||
+          typeof rawBroker.label !== 'string' ||
+          rawBroker.label.length > 100 ||
+          typeof rawBroker.endpoint !== 'string' ||
+          rawBroker.endpoint.length > 2048 ||
+          typeof rawBroker.key !== 'string' ||
+          rawBroker.key.length > 4096 ||
+          typeof rawBroker.secret !== 'string' ||
+          rawBroker.secret.length > 4096 ||
+          typeof rawBroker.message !== 'string' ||
+          rawBroker.message.length > 1000
+        ) {
+          continue
+        }
+        const broker: BrokerConnection = {
+          id: rawBroker.id,
+          kind: def.kind,
+          label: rawBroker.label,
+          endpoint: rawBroker.endpoint,
+          key: rawBroker.key,
+          secret: rawBroker.secret,
+          status: rawBroker.status === 'linked' ? 'linked' : 'error',
+          message: rawBroker.message,
+        }
+        if (typeof rawBroker.accountPath === 'string' && rawBroker.accountPath.length <= 512) {
+          broker.accountPath = rawBroker.accountPath
+        }
+        if (typeof rawBroker.orderPath === 'string' && rawBroker.orderPath.length <= 512) {
+          broker.orderPath = rawBroker.orderPath
+        }
+        if (typeof rawBroker.checkedAt === 'number' && Number.isFinite(rawBroker.checkedAt)) {
+          broker.checkedAt = rawBroker.checkedAt
+        }
+        brokers.push(broker)
+        brokerKinds.add(def.kind)
+        brokerIds.add(broker.id)
+      }
+    }
     const activeBroker = brokers.some((b) => b.id === parsed.activeBroker)
       ? (parsed.activeBroker as string)
       : PAPER_BROKER_ID
     const routes: Partial<Record<AssetClass, string>> = {}
     const storedRoutes = parsed.routes
-    if (storedRoutes && typeof storedRoutes === 'object') {
+    if (isRecord(storedRoutes)) {
       for (const cls of ASSET_CLASSES) {
         const id = (storedRoutes as Record<string, unknown>)[cls]
         if (typeof id === 'string' && brokers.some((b) => b.id === id)) routes[cls] = id
@@ -164,49 +408,73 @@ export function parseState(raw: string | null): StoredState | null {
     const storedExits = parsed.exits
     if (storedExits && typeof storedExits === 'object') {
       for (const [symbol, raw] of Object.entries(storedExits as Record<string, unknown>)) {
-        const level = raw as Partial<{ stopLoss: number; takeProfit: number }> | null
+        const level = isRecord(raw) ? raw : null
         if (
+          symbol.length > 0 &&
+          symbol.length <= 32 &&
           level &&
           typeof level.stopLoss === 'number' &&
           typeof level.takeProfit === 'number' &&
           Number.isFinite(level.stopLoss) &&
-          Number.isFinite(level.takeProfit)
+          Number.isFinite(level.takeProfit) &&
+          level.stopLoss > 0 &&
+          level.takeProfit > level.stopLoss
         ) {
           exits[symbol] = { stopLoss: level.stopLoss, takeProfit: level.takeProfit }
         }
       }
     }
 
+    const auditKinds: AuditKind[] = [
+      'trade',
+      'block',
+      'streak',
+      'graduation',
+      'session',
+      'stale',
+      'feed',
+      'order',
+      'halt',
+      'resume',
+    ]
     const audit = Array.isArray(parsed.audit)
-      ? (parsed.audit as AuditEvent[])
-          .filter(
-            (e) =>
-              !!e &&
-              typeof e.ts === 'number' &&
-              typeof e.detail === 'string' &&
-              typeof e.kind === 'string',
-          )
-          .slice(0, AUDIT_LIMIT)
+      ? parsed.audit.slice(0, AUDIT_LIMIT).filter(
+          (event): event is AuditEvent =>
+            isRecord(event) &&
+            typeof event.id === 'string' &&
+            event.id.length <= 200 &&
+            typeof event.ts === 'number' &&
+            Number.isFinite(event.ts) &&
+            typeof event.kind === 'string' &&
+            auditKinds.includes(event.kind as AuditKind) &&
+            typeof event.detail === 'string' &&
+            event.detail.length <= 2000 &&
+            (event.subject === undefined ||
+              (typeof event.subject === 'string' && event.subject.length <= 100)),
+        )
       : []
     const storedGovernor = parsed.governor
-    const bookValue = Object.values(portfolio.holdings as Record<string, Holding>).reduce(
+    const bookValue = Object.values(safePortfolio.holdings).reduce(
       (sum, held) => sum + (held?.qty ?? 0) * (held?.avgCost ?? 0),
-      portfolio.cash,
+      safePortfolio.cash,
     )
+    if (!Number.isFinite(bookValue)) return null
     const governor: DayAnchor =
       storedGovernor &&
       typeof storedGovernor.day === 'string' &&
+      storedGovernor.day.length <= 16 &&
       typeof storedGovernor.startEquity === 'number' &&
+      Number.isFinite(storedGovernor.startEquity) &&
       storedGovernor.startEquity > 0
         ? { day: storedGovernor.day, startEquity: storedGovernor.startEquity }
         : newDayAnchor(bookValue, Date.now())
 
     return {
-      portfolio: { ...startingPortfolio(), ...portfolio },
-      fills: Array.isArray(parsed.fills) ? parsed.fills.slice(0, 160) : [],
-      history: Array.isArray(parsed.history) ? parsed.history.slice(0, 1200) : [],
+      portfolio: safePortfolio,
+      fills: parseFills(parsed.fills, 160),
+      history: parseFills(parsed.history, 1200),
       bot: loadBot(parsed.bot),
-      orders: Array.isArray(parsed.orders) ? parsed.orders.slice(0, 40) : [],
+      orders: parseOrders(parsed.orders),
       equity: parseEquity(parsed.equity),
       brokers,
       activeBroker,
@@ -221,12 +489,18 @@ export function parseState(raw: string | null): StoredState | null {
 }
 
 export function loadState(): StoredState {
-  const primary = parseState(
-    localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY),
-  )
-  if (primary) return primary
-  const backup = parseState(localStorage.getItem(STORAGE_BACKUP_KEY))
-  if (backup) return backup
+  try {
+    expectedPrimary = localStorage.getItem(DESK_STORAGE_KEY)
+    const primary = parseState(
+      expectedPrimary ?? localStorage.getItem(LEGACY_STORAGE_KEY),
+    )
+    if (primary) return primary
+    const backup = parseState(localStorage.getItem(STORAGE_BACKUP_KEY))
+    if (backup) return backup
+  } catch {
+    // Storage can be disabled or unavailable; the desk still works in memory.
+    expectedPrimary = null
+  }
   return emptyState()
 }
 
@@ -268,6 +542,7 @@ function serialise(state: StoredState): string {
 }
 
 let lastBackupAt = 0
+let expectedPrimary: string | null = null
 const BACKUP_EVERY_MS = 5 * 60_000
 
 /**
@@ -277,14 +552,17 @@ const BACKUP_EVERY_MS = 5 * 60_000
  */
 export function saveDesk(state: StoredState, now = Date.now()): boolean {
   try {
+    const current = localStorage.getItem(DESK_STORAGE_KEY)
+    if (current !== expectedPrimary) return false
     if (now - lastBackupAt > BACKUP_EVERY_MS) {
-      const previous = localStorage.getItem(STORAGE_KEY)
-      if (previous && parseState(previous)) {
-        localStorage.setItem(STORAGE_BACKUP_KEY, previous)
+      if (current && parseState(current)) {
+        localStorage.setItem(STORAGE_BACKUP_KEY, current)
         lastBackupAt = now
       }
     }
-    localStorage.setItem(STORAGE_KEY, serialise(state))
+    const next = serialise(state)
+    localStorage.setItem(DESK_STORAGE_KEY, next)
+    expectedPrimary = next
     return true
   } catch {
     return false

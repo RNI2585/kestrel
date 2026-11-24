@@ -3,6 +3,7 @@ import { FEE, type Holding, type OrderType, type Side } from '../trade'
 import type { Instrument } from '../market'
 import { defineBroker, paperConnection, venueSymbol, type BrokerConnection } from '../brokers'
 import { money, price } from '../format'
+import { quoteStale } from '../session'
 
 interface Props {
   instrument: Instrument
@@ -10,6 +11,7 @@ interface Props {
   holding?: Holding
   connections: BrokerConnection[]
   activeBrokerId: string
+  maxQuoteAgeSec: number
   /** The routed venue is the one saved for this instrument's asset class. */
   remembered: boolean
   onRoute: (id: string) => void
@@ -27,6 +29,7 @@ export default function TradeTicket({
   holding,
   connections,
   activeBrokerId,
+  maxQuoteAgeSec,
   remembered,
   onRoute,
   onSubmit,
@@ -47,6 +50,10 @@ export default function TradeTicket({
   const activeDef = defineBroker(activeConn.kind)
   const activePair = activeConn.kind === 'paper' ? instrument.symbol : venueSymbol(activeConn.kind, instrument.symbol)
   const blocked = Boolean(activeConn.kind !== 'paper' && !activePair)
+  const quoteCurrent =
+    instrument.live && !quoteStale(instrument, Date.now(), maxQuoteAgeSec * 1000)
+  const quoteBlocked =
+    type === 'market' && activeConn.kind !== 'paper' && !quoteCurrent
 
   const qty = Number(qtyText)
   const validQty = Number.isFinite(qty) && qty > 0 ? qty : 0
@@ -262,7 +269,13 @@ export default function TradeTicket({
           ? `Rests until ${instrument.symbol} trades ${side === 'buy' ? 'at or below' : 'at or above'} ${
               validLimit ? price(validLimit, instrument.dp) : '—'
             } · 2 bps commission`
-          : `Fill at ${price(instrument.price, instrument.dp)} · 2 basis points commission`}
+          : `Fill at ${price(instrument.price, instrument.dp)} · 2 basis points commission · ${
+              quoteCurrent
+                ? `Live · ${instrument.source ?? 'provider'}`
+                : instrument.live
+                  ? `Stale · ${instrument.source ?? 'provider'}`
+                  : 'Simulated quote'
+            }`}
       </p>
 
       <p className="ticket__route">
@@ -270,9 +283,11 @@ export default function TradeTicket({
           ? 'Limit orders rest in the terminal ledger until they fill; they are not sent to the venue.'
           : activeConn.kind === 'paper'
             ? 'Market fills are simulated locally by the paper ledger.'
-            : `Market orders are sent to ${activeConn.label}${
-                activePair && activePair !== instrument.symbol ? ` as ${activePair}` : ''
-              }.`}
+            : quoteCurrent
+              ? `Market orders are sent to ${activeConn.label}${
+                  activePair && activePair !== instrument.symbol ? ` as ${activePair}` : ''
+                }.`
+              : 'External orders are disabled until this instrument has a fresh live quote.'}
       </p>
 
       {blocked && (
@@ -284,7 +299,11 @@ export default function TradeTicket({
 
       {error && <p className="error">{error}</p>}
 
-      <button className="submit" onClick={() => void submit()} disabled={pending || blocked}>
+      <button
+        className="submit"
+        onClick={() => void submit()}
+        disabled={pending || blocked || quoteBlocked}
+      >
         {actionLabel}
       </button>
     </section>

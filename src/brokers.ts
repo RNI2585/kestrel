@@ -1,3 +1,5 @@
+import { httpUrlError } from './urlPolicy'
+
 export type BrokerKind =
   | 'paper'
   | 'alpaca'
@@ -51,6 +53,26 @@ export interface BrokerOrder {
   qty: number
   price: number
 }
+
+export type BrokerOrderStatus = 'accepted' | 'filled' | 'partial' | 'unknown' | 'rejected'
+
+export interface BrokerOrderResult {
+  ok: boolean
+  status: BrokerOrderStatus
+  message: string
+  orderId?: string
+  filledQty?: number
+  averagePrice?: number
+}
+
+export type BrokerOrderAck =
+  | { status: 'accepted'; orderId?: string }
+  | {
+      status: 'filled' | 'partial'
+      orderId?: string
+      filledQty: number
+      averagePrice: number
+    }
 
 export const PAPER_BROKER_ID = 'paper'
 
@@ -590,6 +612,78 @@ function venueError(json: unknown): string | null {
   return null
 }
 
+function object(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function firstValue(objects: Record<string, unknown>[], keys: string[]): unknown {
+  for (const body of objects) {
+    for (const key of keys) {
+      if (body[key] !== undefined && body[key] !== null) return body[key]
+    }
+  }
+  return undefined
+}
+
+/** Extracts a confirmed fill only when the response gives execution data. */
+export function parseBrokerOrderAck(
+  raw: unknown,
+  requestedQty: number,
+): BrokerOrderAck {
+  const root = object(raw)
+  const result = root && object(root.result)
+  const data = root && object(root.data)
+  const order = root && object(root.order)
+  const records = [order, result, data, root].filter(
+    (value): value is Record<string, unknown> => value !== null,
+  )
+  const rawId = firstValue(records, ['orderId', 'order_id', 'clientOrderId', 'id', 'txid'])
+  const idValue = Array.isArray(rawId) ? rawId[0] : rawId
+  const orderId =
+    typeof idValue === 'string' || typeof idValue === 'number' ? String(idValue) : undefined
+  const statusValue = firstValue(records, ['status', 'orderStatus', 'order_status'])
+  const status = typeof statusValue === 'string' ? statusValue.toLowerCase() : ''
+  const filledQty = Number(
+    firstValue(records, [
+      'filledQty',
+      'filled_qty',
+      'executedQty',
+      'cumExecQty',
+      'cumulativeFilledQty',
+      'vol_exec',
+    ]),
+  )
+  let averagePrice = Number(
+    firstValue(records, ['averagePrice', 'avgPrice', 'avg_price', 'filled_avg_price']),
+  )
+  if (!Number.isFinite(averagePrice) || averagePrice <= 0) {
+    const quoteValue = Number(
+      firstValue(records, ['cummulativeQuoteQty', 'cumulativeQuoteQty', 'cumExecValue']),
+    )
+    if (Number.isFinite(quoteValue) && quoteValue > 0 && filledQty > 0) {
+      averagePrice = quoteValue / filledQty
+    }
+  }
+  const hasExecution =
+    Number.isFinite(filledQty) &&
+    filledQty > 0 &&
+    filledQty <= requestedQty + 1e-8 &&
+    Number.isFinite(averagePrice) &&
+    averagePrice > 0 &&
+    (['filled', 'closed', 'complete', 'completed', 'executed', 'partially_filled'].includes(status) ||
+      filledQty >= requestedQty - 1e-8)
+
+  if (!hasExecution) return { status: 'accepted', orderId }
+  return {
+    status: filledQty >= requestedQty - 1e-8 ? 'filled' : 'partial',
+    orderId,
+    filledQty,
+    averagePrice,
+  }
+}
+
 function failureHint(conn: BrokerConnection, def: BrokerDef, err: unknown): string {
   if (err instanceof ConfigError) return err.message
   if (err instanceof DOMException && err.name === 'AbortError') {
@@ -613,6 +707,8 @@ export async function verifyBroker(
   if (!endpointOf(conn)) {
     return { status: 'error', message: 'Add the endpoint you want requests sent to first.' }
   }
+  const endpointProblem = httpUrlError(conn.endpoint, 'Broker endpoint')
+  if (endpointProblem) return { status: 'error', message: endpointProblem }
   try {
     const request = await buildAccountRequest(conn, def)
     const res = await withTimeout(request.url, request.init)
@@ -633,23 +729,28 @@ export async function verifyBroker(
 }
 
 /**
- * Sends a market order to the linked venue with a locally built signature. The
- * paper ledger only records the fill once the venue accepts the order.
+ * Sends a market order to the linked venue with a locally built signature.
+ * The local ledger records only executions confirmed by the response.
  */
 export async function submitBrokerOrder(
   conn: BrokerConnection,
   order: BrokerOrder,
-): Promise<{ ok: boolean; message: string }> {
+): Promise<BrokerOrderResult> {
   if (conn.kind === 'paper') {
-    return { ok: true, message: 'Filled on the paper ledger.' }
+    return { ok: true, status: 'filled', message: 'Filled on the paper ledger.', filledQty: order.qty, averagePrice: order.price }
   }
   const def = defineBroker(conn.kind)
-  if (!endpointOf(conn)) return { ok: false, message: 'No endpoint set for this broker.' }
+  if (!endpointOf(conn)) {
+    return { ok: false, status: 'rejected', message: 'No endpoint set for this broker.' }
+  }
+  const endpointProblem = httpUrlError(conn.endpoint, 'Broker endpoint')
+  if (endpointProblem) return { ok: false, status: 'rejected', message: endpointProblem }
 
   const symbol = venueSymbol(conn.kind, order.symbol)
   if (!symbol) {
     return {
       ok: false,
+      status: 'rejected',
       message: `${def.name} does not list ${order.symbol}. It trades ${def.coverage}`,
     }
   }
@@ -660,18 +761,39 @@ export async function submitBrokerOrder(
     const body = safeJson(await res.text())
     if (!res.ok) {
       const detail = venueError(body)
+      const uncertain = res.status >= 500
       return {
         ok: false,
-        message: `${def.name} rejected ${symbol} (${res.status})${detail ? ` — ${detail}` : ''}.`,
+        status: uncertain ? 'unknown' : 'rejected',
+        message: uncertain
+          ? `${def.name} returned ${res.status} for ${symbol}${detail ? ` — ${detail}` : ''}; check the venue before retrying.`
+          : `${def.name} rejected ${symbol} (${res.status})${detail ? ` — ${detail}` : ''}.`,
       }
     }
     const problem = venueError(body)
-    if (problem) return { ok: false, message: `${def.name} rejected ${symbol}: ${problem}` }
+    if (problem) {
+      return { ok: false, status: 'rejected', message: `${def.name} rejected ${symbol}: ${problem}` }
+    }
+    const ack = parseBrokerOrderAck(body, order.qty)
+    const orderLabel = ack.orderId ? ` ${ack.orderId}` : ''
+    if (ack.status === 'accepted') {
+      return {
+        ok: true,
+        ...ack,
+        message: `${symbol} order${orderLabel} accepted by ${def.name}; fill not confirmed yet.`,
+      }
+    }
+    const fillDescription = ack.status === 'partial' ? 'partially filled' : 'filled'
     return {
       ok: true,
-      message: `${symbol} ${order.side} ${Number(order.qty.toFixed(6))} accepted by ${def.name}.`,
+      ...ack,
+      message: `${symbol} ${order.side} ${Number(ack.filledQty.toFixed(6))} ${fillDescription} by ${def.name} at ${Number(ack.averagePrice.toFixed(8))}${orderLabel}.`,
     }
   } catch (err) {
-    return { ok: false, message: failureHint(conn, def, err) }
+    return {
+      ok: false,
+      status: 'unknown',
+      message: `${failureHint(conn, def, err)} The order outcome is unknown; check the venue before retrying.`,
+    }
   }
 }

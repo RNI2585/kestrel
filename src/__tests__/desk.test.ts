@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { MarketEngine } from '../market'
 import { marketState, quoteStale } from '../session'
 import { AUDIT_DEDUPE_MS, AUDIT_LIMIT, noteOnce, pushAudit } from '../audit'
 import { timeTicks, positionOf } from '../timeline'
@@ -13,6 +14,19 @@ const utc = (iso: string) => new Date(iso)
 describe('market sessions', () => {
   it('runs crypto around the clock', () => {
     expect(marketState('Crypto', utc('2026-11-28T03:00:00Z'))).toBe('open')
+  })
+
+  describe('live price handling', () => {
+    it('does not invent simulated ticks between live quote updates', () => {
+      const engine = new MarketEngine()
+      engine.applyLive({
+        BTC: { price: 64_000, source: 'test feed', at: Date.now() },
+      })
+
+      engine.tick()
+
+      expect(engine.get('BTC')?.price).toBe(64_000)
+    })
   })
 
   it('shuts US equities outside 13:30–20:00 UTC on weekdays', () => {

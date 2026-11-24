@@ -1,4 +1,5 @@
 import type { QuoteUpdate } from './market'
+import { httpUrlError } from './urlPolicy'
 
 /**
  * Streaming quotes.
@@ -213,6 +214,11 @@ export function startBridgeStream(url: string, handlers: Omit<StreamHandlers, 'u
   const { onQuotes, onStatus } = handlers
   const target = url.trim()
   if (!target) return () => {}
+  const urlProblem = httpUrlError(target, 'Quote stream')
+  if (urlProblem) {
+    onStatus({ state: 'error', detail: urlProblem, at: Date.now() })
+    return () => {}
+  }
   if (typeof EventSource === 'undefined') {
     onStatus({ state: 'idle', detail: 'This browser has no EventSource support', at: Date.now() })
     return () => {}
