@@ -1,5 +1,10 @@
 import { useState } from 'react'
-import { runBacktest, type BacktestResult } from '../backtest'
+import {
+  runBacktest,
+  walkForward,
+  type BacktestResult,
+  type WalkForwardResult,
+} from '../backtest'
 import { STRATEGIES, type BotConfig } from '../bot'
 import type { Instrument } from '../market'
 import { money, signedPct } from '../format'
@@ -11,12 +16,13 @@ interface Props {
 
 export default function BacktestPanel({ instrument, bot }: Props) {
   const [result, setResult] = useState<BacktestResult | null>(null)
-  const [running, setRunning] = useState(false)
+  const [walk, setWalk] = useState<WalkForwardResult | null>(null)
+  const [running, setRunning] = useState<'backtest' | 'walk' | null>(null)
   const strategy = STRATEGIES.find((s) => s.id === bot.strategy)
 
   const run = () => {
     const seed = Math.floor(Math.random() * 2 ** 30)
-    setRunning(true)
+    setRunning('backtest')
     // let the button show its state before the replay blocks the frame
     window.setTimeout(() => {
       setResult(
@@ -28,7 +34,29 @@ export default function BacktestPanel({ instrument, bot }: Props) {
           seed,
         }),
       )
-      setRunning(false)
+      setRunning(null)
+    }, 40)
+  }
+
+  /** Fits exits on one set of tapes and scores the winner on unseen ones. */
+  const runWalkForward = () => {
+    setRunning('walk')
+    window.setTimeout(() => {
+      setWalk(
+        walkForward({
+          symbol: instrument.symbol,
+          vol: instrument.vol,
+          startPrice: instrument.base,
+          baseCfg: bot,
+          stopPcts: [1.5, 2.5, 4],
+          takeProfitPcts: [4, 6, 8],
+          riskPcts: [2, 4],
+          trainSeeds: [11, 12, 13],
+          testSeeds: [91, 92, 93],
+          ticks: 400,
+        }),
+      )
+      setRunning(null)
     }, 40)
   }
 
@@ -50,10 +78,57 @@ export default function BacktestPanel({ instrument, bot }: Props) {
             current strategy, risk, stop and target settings.
           </p>
         </div>
-        <button className="submit backtest__btn" onClick={run} disabled={running}>
-          {running ? 'Running…' : result ? 'Run again' : 'Run backtest'}
+        <button className="submit backtest__btn" onClick={run} disabled={running !== null}>
+          {running === 'backtest' ? 'Running…' : result ? 'Run again' : 'Run backtest'}
+        </button>
+        <button
+          className="mini-btn backtest__btn"
+          onClick={runWalkForward}
+          disabled={running !== null}
+        >
+          {running === 'walk' ? 'Fitting…' : 'Walk forward'}
         </button>
       </div>
+
+      {walk && (
+        <div className="walk">
+          <div className="walk__head">
+            <strong>
+              Fitted stop {walk.fitted.stopPct}% · target {walk.fitted.takeProfitPct}% · risk{' '}
+              {walk.fitted.riskPct}%
+            </strong>
+            <span className={`walk__verdict ${walk.survives ? 'is-good' : 'is-bad'}`}>
+              {walk.survives ? 'Holds out of sample' : 'Failed out of sample'}
+            </span>
+          </div>
+          <dl className="backtest__stats">
+            <div>
+              <dt>In sample</dt>
+              <dd className={walk.inSample.returnPct >= 0 ? 'up' : 'down'}>
+                {signedPct(walk.inSample.returnPct)}
+              </dd>
+            </div>
+            <div>
+              <dt>Unseen tapes</dt>
+              <dd className={walk.outOfSample.returnPct >= 0 ? 'up' : 'down'}>
+                {signedPct(walk.outOfSample.returnPct)}
+              </dd>
+            </div>
+            <div>
+              <dt>Decay</dt>
+              <dd className={walk.decayPct >= 0 ? 'up' : 'down'}>{signedPct(walk.decayPct)}</dd>
+            </div>
+            <div>
+              <dt>Unseen drawdown</dt>
+              <dd className="down">−{walk.outOfSample.maxDrawdownPct.toFixed(2)}%</dd>
+            </div>
+          </dl>
+          <p className="ticket__hint">
+            Exits are chosen on three synthetic tapes, then scored on three the fit never saw. A
+            large negative decay means the settings were fitted to noise.
+          </p>
+        </div>
+      )}
 
       {result && (
         <>

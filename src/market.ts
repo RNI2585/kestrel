@@ -77,6 +77,9 @@ const DEFS: InstrumentDef[] = [
 
 const HISTORY = 320
 
+/** The crypto symbols, derived once so the poller and the socket agree. */
+export const CRYPTO_SYMBOLS = DEFS.filter((d) => d.cls === 'Crypto').map((d) => d.symbol)
+
 function randn(): number {
   let u = 0
   let v = 0

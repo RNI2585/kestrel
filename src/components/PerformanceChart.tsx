@@ -18,11 +18,13 @@ export default function PerformanceChart({
   fills,
   startTs,
   deposited,
+  symbol,
 }: {
   points: EquityPoint[]
   fills: Fill[]
   startTs: number
   deposited: number
+  symbol?: string
 }) {
   const nowTs = points.length > 0 ? points[points.length - 1].t : startTs
   const ticks = useMemo(() => timeTicks(Math.max(nowTs - startTs, 60_000)), [nowTs, startTs])
@@ -53,6 +55,38 @@ export default function PerformanceChart({
   const last = points[points.length - 1].v
   const change = last - deposited
 
+  // Peak-to-trough drawdown is the number that says how bad it got, not how
+  // good it ended.
+  let peak = values[0]
+  let drawdown = 0
+  for (const value of values) {
+    if (value > peak) peak = value
+    if (peak > 0) drawdown = Math.max(drawdown, ((peak - value) / peak) * 100)
+  }
+
+  const exportCsv = () => {
+    const rows = ['section,ts,iso,value,detail']
+    for (const p of points) {
+      rows.push(`equity,${p.t},${new Date(p.t).toISOString()},${p.v.toFixed(2)},`)
+    }
+    for (const fill of fills) {
+      if (fill.ts < startTs) continue
+      const detail = `${fill.side} ${fill.symbol} ${fill.qty.toFixed(6)} @ ${fill.price}`
+      rows.push(
+        `fill,${fill.ts},${new Date(fill.ts).toISOString()},${(fill.pnl ?? 0).toFixed(2)},"${detail}"`,
+      )
+    }
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `kestrel-${symbol ?? 'session'}-${new Date(startTs)
+      .toISOString()
+      .slice(0, 10)}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
   const marked = fills
     .filter((f) => f.ts >= startTs)
     .map((fill) => {
@@ -75,6 +109,10 @@ export default function PerformanceChart({
         <span className={change >= 0 ? 'up' : 'down'}>
           {signedMoney(change)} on the session
         </span>
+        <span className="perf__dd">max drawdown {drawdown.toFixed(2)}%</span>
+        <button className="mini-btn perf__export" onClick={exportCsv}>
+          Export CSV
+        </button>
         <span className="perf__key">
           <i className="perf__dot perf__dot--buy" aria-hidden="true" /> entry
           <i className="perf__dot perf__dot--win" aria-hidden="true" /> winning exit

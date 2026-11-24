@@ -1,5 +1,6 @@
 import type { StrategyId } from './bot'
 import type { IndicatorReading } from './trade'
+import { clampLimits, DEFAULT_RISK_LIMITS, type RiskLimits } from './risk'
 
 /** The local profile the login screen creates. Nothing leaves the browser. */
 export interface Profile {
@@ -16,11 +17,20 @@ export interface Settings {
   requireApproval: boolean
   /** How far price may drift before a queued proposal is stale, in percent. */
   maxDriftPct: number
+  /** The limits that guard an unattended bot. */
+  limits: RiskLimits
+  /**
+   * An SSE bridge that streams quotes for markets with no key-less feed —
+   * stocks and energy. Empty means the poller and the simulated tape.
+   */
+  streamUrl: string
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   requireApproval: true,
   maxDriftPct: 0.4,
+  limits: DEFAULT_RISK_LIMITS,
+  streamUrl: '',
 }
 
 const SETTINGS_KEY = 'kestrel.settings.v1'
@@ -50,6 +60,9 @@ export function loadSettings(): Settings {
       typeof source.maxDriftPct === 'number' && source.maxDriftPct > 0
         ? source.maxDriftPct
         : DEFAULT_SETTINGS.maxDriftPct,
+    limits: clampLimits(source.limits),
+    streamUrl:
+      typeof source.streamUrl === 'string' ? source.streamUrl.trim().slice(0, 400) : '',
   }
 }
 

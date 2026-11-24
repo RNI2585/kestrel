@@ -1,6 +1,25 @@
 import { useState } from 'react'
 import { money } from '../format'
+import { clampLimits, type RiskLimits } from '../risk'
 import type { Profile, Settings } from '../settings'
+
+/** One input per governor limit, in the order they matter. */
+const RISK_FIELDS: {
+  key: keyof RiskLimits
+  label: string
+  unit: string
+  min: number
+  max: number
+  step: number
+}[] = [
+  { key: 'maxDailyLossPct', label: 'Daily loss limit', unit: '%', min: 0.1, max: 50, step: 0.1 },
+  { key: 'maxExposurePct', label: 'Max exposure', unit: '%', min: 5, max: 500, step: 5 },
+  { key: 'maxPositions', label: 'Max open positions', unit: '', min: 1, max: 50, step: 1 },
+  { key: 'maxTradesPerDay', label: 'Max entries a day', unit: '', min: 1, max: 500, step: 1 },
+  { key: 'maxConsecutiveLosses', label: 'Pause after losers in a row', unit: '', min: 1, max: 50, step: 1 },
+  { key: 'graduationTrades', label: 'Graduation bar', unit: ' closed', min: 1, max: 200, step: 1 },
+  { key: 'maxQuoteAgeSec', label: 'Max quote age', unit: 's', min: 15, max: 3600, step: 15 },
+]
 
 interface Props {
   profile: Profile
@@ -146,6 +165,87 @@ export default function SettingsView({
 
         <section className="panel">
           <header className="panel__head">
+            <h2>Risk governor</h2>
+            <span className={`status ${settings.limits.requireGraduation ? 'status--on' : ''}`}>
+              <i aria-hidden="true" />
+              {settings.limits.requireGraduation ? 'Graduation enforced' : 'Ungraded models'}
+            </span>
+          </header>
+          <p className="hint">
+            These limits pause new entries — never exits — and the day resets at local midnight.
+            Every breach is written to the desk log in Current trades.
+          </p>
+          <div className="settings__risk">
+            {RISK_FIELDS.map((field) => (
+              <label className="field field--tight" key={field.key}>
+                <span>
+                  {field.label}
+                  {field.unit && <em className="field__unit">{field.unit}</em>}
+                </span>
+                <input
+                  type="number"
+                  min={field.min}
+                  max={field.max}
+                  step={field.step}
+                  value={settings.limits[field.key] as number}
+                  onChange={(e) =>
+                    onChangeSettings({
+                      limits: clampLimits({
+                        ...settings.limits,
+                        [field.key]: Number(e.target.value),
+                      }),
+                    })
+                  }
+                />
+              </label>
+            ))}
+          </div>
+          <label className="check settings__check">
+            <input
+              type="checkbox"
+              checked={settings.limits.requireGraduation}
+              onChange={(e) =>
+                onChangeSettings({
+                  limits: { ...settings.limits, requireGraduation: e.target.checked },
+                })
+              }
+            />
+            <span>Only trade a model unattended once it has earned it</span>
+          </label>
+          <p className="hint">
+            With this on, auto execution needs {settings.limits.graduationTrades} closed round trips
+            on the armed model and a positive net result before it will book a single entry.
+            Proposals are always allowed, so a new model can still build that record.
+          </p>
+        </section>
+
+        <section className="panel">
+          <header className="panel__head">
+            <h2>Live quotes</h2>
+            <span className={`status ${settings.streamUrl.trim() ? 'status--on' : ''}`}>
+              <i aria-hidden="true" />
+              {settings.streamUrl.trim() ? 'Bridge set' : 'Public feeds'}
+            </span>
+          </header>
+          <label className="field">
+            <span>Quote stream URL</span>
+            <input
+              value={settings.streamUrl}
+              placeholder="https://your-bridge.example.com/quotes"
+              spellCheck={false}
+              onChange={(e) => onChangeSettings({ streamUrl: e.target.value })}
+            />
+          </label>
+          <p className="hint">
+            Crypto already streams from Coinbase’s public ticker socket. Stocks and energy have no
+            key-less feed, so they stay simulated until an SSE bridge you run emits{' '}
+            {'{"symbol":"AAPL","price":228.4}'} events on this URL. Keep any provider key inside
+            that bridge — never in this field.
+          </p>
+        </section>
+
+        <section className="panel">
+          <header className="panel__head">
             <h2>Paper account</h2>
             <span className="panel__meta">Opened with {money(startingCash, 0)}</span>
           </header>
@@ -179,7 +279,8 @@ export default function SettingsView({
           </div>
           <p className="hint">
             A backup holds the paper account, fills, bot settings and broker connections — never
-            broker keys, which you re-enter after restoring.
+            broker keys, which you re-enter after restoring. The desk also saves to this browser on
+            every change, with a rolling snapshot kept as a fallback.
           </p>
           <button className="mini-btn mini-btn--danger settings__reset" onClick={onReset}>
             Reset to {money(startingCash, 0)}

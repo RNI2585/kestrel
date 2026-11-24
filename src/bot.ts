@@ -595,6 +595,12 @@ export function runBotStep(
   tick: number,
   route = false,
   exits?: ExitBook,
+  /**
+   * Asked before any entry. Returning a message skips the entry (and leaves
+   * the cooldown untouched) while exits still run, so a risk or session limit
+   * can never trap an open position.
+   */
+  entryBlock?: (ins: Instrument) => string | null,
 ): BotStepResult {
   let portfolio = start
   const fills: Fill[] = []
@@ -652,6 +658,10 @@ export function runBotStep(
     }
 
     if (!side || qty <= 0) continue
+
+    if (side === 'buy' && entryBlock) {
+      if (entryBlock(ins)) continue
+    }
 
     cooldowns[ins.symbol] = tick
 

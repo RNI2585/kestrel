@@ -264,6 +264,7 @@ export function sweepCombo(opts: {
   stopPct: number
   takeProfitPct: number
   riskPct: number
+  ticks?: number
 }): SweepRow {
   const cfg: BotConfig = withRisk({ ...opts.baseCfg }, {
     riskPct: opts.riskPct,
@@ -277,6 +278,7 @@ export function sweepCombo(opts: {
       startPrice: opts.startPrice,
       cfg,
       seed,
+      ticks: opts.ticks,
     }),
   )
   const avg = averageBacktests(runs)
@@ -291,5 +293,113 @@ export function sweepCombo(opts: {
     trades: avg.trades,
     maxDrawdownPct: avg.maxDrawdownPct,
     profitableRuns: avg.profitableRuns,
+  }
+}
+
+/** The exits a walk-forward fit landed on, and what they did out of sample. */
+export interface WalkForwardResult {
+  symbol: string
+  fitted: { stopPct: number; takeProfitPct: number; riskPct: number }
+  /** The winning combination averaged over the tapes it was fitted on. */
+  inSample: BacktestAverages
+  /** The same exits averaged over tapes the fit never saw. */
+  outOfSample: BacktestAverages
+  /** Out-of-sample return minus in-sample return, in percentage points. */
+  decayPct: number
+  /** True when the fitted exits still made money on unseen tapes. */
+  survives: boolean
+}
+
+/**
+ * Fits stop, target and risk on one set of synthetic tapes, then scores the
+ * winner on a disjoint set. A combination that only works on the tapes it was
+ * chosen on is curve-fit, and the decay between the two columns is the honest
+ * measure of that.
+ */
+export function walkForward(opts: {
+  symbol: string
+  vol: number
+  startPrice: number
+  baseCfg: BotConfig
+  stopPcts: number[]
+  takeProfitPcts: number[]
+  riskPcts: number[]
+  trainSeeds: number[]
+  testSeeds: number[]
+  ticks?: number
+}): WalkForwardResult {
+  let best: SweepRow | null = null
+  for (const stopPct of opts.stopPcts) {
+    for (const takeProfitPct of opts.takeProfitPcts) {
+      for (const riskPct of opts.riskPcts) {
+        const row = sweepCombo({
+          symbol: opts.symbol,
+          vol: opts.vol,
+          startPrice: opts.startPrice,
+          baseCfg: opts.baseCfg,
+          seeds: opts.trainSeeds,
+          stopPct,
+          takeProfitPct,
+          riskPct,
+          ticks: opts.ticks,
+        })
+        // The highest average return wins; ties go to the tighter stop, since
+        // the fit should not be decided by luck between equal results.
+        if (
+          !best ||
+          row.returnPct > best.returnPct + 1e-9 ||
+          (Math.abs(row.returnPct - best.returnPct) <= 1e-9 && row.stopPct < best.stopPct)
+        ) {
+          best = row
+        }
+      }
+    }
+  }
+
+  const fitted = best ?? { stopPct: 2.5, takeProfitPct: 6, riskPct: 3, returnPct: 0 }
+  const inSample = averageBacktests(
+    opts.trainSeeds.map((seed) =>
+      runBacktest({
+        symbol: opts.symbol,
+        vol: opts.vol,
+        startPrice: opts.startPrice,
+        cfg: withRisk({ ...opts.baseCfg }, {
+          riskPct: fitted.riskPct,
+          stopLossPct: fitted.stopPct,
+          takeProfitPct: fitted.takeProfitPct,
+        }),
+        seed,
+        ticks: opts.ticks,
+      }),
+    ),
+  )
+  const outOfSample = averageBacktests(
+    opts.testSeeds.map((seed) =>
+      runBacktest({
+        symbol: opts.symbol,
+        vol: opts.vol,
+        startPrice: opts.startPrice,
+        cfg: withRisk({ ...opts.baseCfg }, {
+          riskPct: fitted.riskPct,
+          stopLossPct: fitted.stopPct,
+          takeProfitPct: fitted.takeProfitPct,
+        }),
+        seed,
+        ticks: opts.ticks,
+      }),
+    ),
+  )
+
+  return {
+    symbol: opts.symbol,
+    fitted: {
+      stopPct: fitted.stopPct,
+      takeProfitPct: fitted.takeProfitPct,
+      riskPct: fitted.riskPct,
+    },
+    inSample,
+    outOfSample,
+    decayPct: outOfSample.returnPct - inSample.returnPct,
+    survives: outOfSample.returnPct > 0,
   }
 }

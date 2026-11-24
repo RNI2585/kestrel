@@ -1,4 +1,4 @@
-import type { QuoteUpdate } from './market'
+import { CRYPTO_SYMBOLS, type QuoteUpdate } from './market'
 
 /**
  * Free, key-less quotes the browser may call directly (all three send
@@ -13,7 +13,6 @@ import type { QuoteUpdate } from './market'
  * simulated tape and are marked as such in the terminal.
  */
 
-const CRYPTO = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE', 'AVAX', 'LINK', 'DOT', 'LTC', 'BCH', 'SUI']
 const METALS = ['XAU', 'XAG', 'XPT']
 
 /** Pairs quoted as units of `quote` per one `base`, the usual FX convention. */
@@ -57,7 +56,7 @@ async function cryptoQuotes(at: number, failed: string[]): Promise<Record<string
   const out: Record<string, QuoteUpdate> = {}
   let missed = 0
   await Promise.all(
-    CRYPTO.map(async (symbol) => {
+    CRYPTO_SYMBOLS.map(async (symbol) => {
       try {
         const raw = (await getJson(
           `https://api.exchange.coinbase.com/products/${symbol}-USD/stats`,
@@ -73,7 +72,7 @@ async function cryptoQuotes(at: number, failed: string[]): Promise<Record<string
       }
     }),
   )
-  if (missed > 0) failed.push(`Coinbase missed ${missed} of ${CRYPTO.length} pairs`)
+  if (missed > 0) failed.push(`Coinbase missed ${missed} of ${CRYPTO_SYMBOLS.length} pairs`)
   return out
 }
 

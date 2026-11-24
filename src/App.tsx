@@ -1,15 +1,14 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
-  ASSET_CLASSES,
   CLASS_COLOR,
+  CRYPTO_SYMBOLS,
   MarketEngine,
   changePct,
   type AssetClass,
   type Instrument,
+  type QuoteUpdate,
 } from './market'
 import {
-  DEFAULT_BOT,
-  DEFAULT_RISK,
   STRATEGIES,
   patchRisk,
   riskFor,
@@ -33,9 +32,7 @@ import {
   type WorkingOrder,
 } from './trade'
 import {
-  BROKER_DEFS,
   PAPER_BROKER_ID,
-  defaultConnections,
   paperConnection,
   submitBrokerOrder,
   venueSymbol,
@@ -45,7 +42,17 @@ import { clockTime, money, price as fmtPrice, signedPct } from './format'
 import { exitHit, exitsFrom, type ExitBook } from './exits'
 import { fetchLiveQuotes } from './liveQuotes'
 import { matchFill, strategyRecords } from './match'
-import { parseEquity, type EquityPoint } from './timeline'
+import {
+  consecutiveLosses,
+  entriesToday,
+  evaluateRisk,
+  rollDay,
+  type DayAnchor,
+  type RiskBlock,
+} from './risk'
+import { closedNote, marketState, quoteStale } from './session'
+import { noteOnce, type AuditEvent, type AuditKind } from './audit'
+import type { EquityPoint } from './timeline'
 import {
   clearProfile,
   loadProfile,
@@ -74,13 +81,22 @@ import ScriptsPanel from './components/ScriptsPanel'
 import ScanPanel from './components/ScanPanel'
 import StrategiesTab from './components/StrategiesTab'
 import PerformanceChart from './components/PerformanceChart'
+import DeskLog from './components/DeskLog'
 import Proposals from './components/Proposals'
 import SettingsView from './components/SettingsView'
 import LoginScreen from './components/LoginScreen'
+import Topbar from './components/Topbar'
+import AnalyticsPanel from './components/AnalyticsPanel'
+import RiskPanel from './components/RiskPanel'
+import Reconciliation from './components/Reconciliation'
+import { loadState, parseState, saveDesk, withoutSecrets, type StoredState } from './storage'
+import { catchUp, humanSpan, requestWakeLock, TICK_MS } from './scheduler'
+import {
+  startBridgeStream,
+  startCoinbaseStream,
+  type StreamStatus,
+} from './quoteStream'
 
-const STORAGE_KEY = 'kestrel.terminal.v1'
-/** The key written before the rename, read once so the account survives it. */
-const LEGACY_STORAGE_KEY = 'meridian.terminal.v1'
 
 const RANGES = [
   { id: '1H', points: 60 },
@@ -171,169 +187,6 @@ const DOCK_ICONS: Record<ViewId, ReactNode> = {
   ),
 }
 
-interface StoredState {
-  portfolio: Portfolio
-  fills: Fill[]
-  /** A longer archive behind the trade log, so closed trades survive reloads. */
-  history: Fill[]
-  bot: BotConfig
-  orders: WorkingOrder[]
-  /** Equity samples with the moment each was taken, for the session chart. */
-  equity: EquityPoint[]
-  brokers: BrokerConnection[]
-  activeBroker: string
-  /** Venue the ticket picks for each asset class. */
-  routes: Partial<Record<AssetClass, string>>
-  /** The stop and target each open position was taken with. */
-  exits: ExitBook
-}
-
-function emptyState(): StoredState {
-  return {
-    portfolio: startingPortfolio(),
-    fills: [],
-    history: [],
-    bot: DEFAULT_BOT,
-    orders: [],
-    equity: [],
-    brokers: defaultConnections(),
-    activeBroker: PAPER_BROKER_ID,
-    routes: {},
-    exits: {},
-  }
-}
-
-/**
- * Rebuilds the bot config. Saves from before per-strategy exits held one shared
- * set, which is kept with the strategy that was armed at the time.
- */
-function loadBot(raw: unknown): BotConfig {
-  const stored = (raw && typeof raw === 'object' ? raw : {}) as Partial<BotConfig> &
-    Partial<RiskSettings>
-  const strategy = STRATEGIES.some((s) => s.id === stored.strategy)
-    ? (stored.strategy as StrategyId)
-    : DEFAULT_BOT.strategy
-
-  const riskPrefs: Partial<Record<StrategyId, RiskSettings>> = {}
-  const savedPrefs = stored.riskPrefs
-  if (savedPrefs && typeof savedPrefs === 'object') {
-    for (const s of STRATEGIES) {
-      const saved = savedPrefs[s.id]
-      if (saved) riskPrefs[s.id] = { ...DEFAULT_RISK[s.id], ...saved }
-    }
-  }
-  if (
-    !riskPrefs[strategy] &&
-    (stored.riskPct !== undefined ||
-      stored.stopLossPct !== undefined ||
-      stored.takeProfitPct !== undefined)
-  ) {
-    riskPrefs[strategy] = {
-      ...DEFAULT_RISK[strategy],
-      ...(typeof stored.riskPct === 'number' ? { riskPct: stored.riskPct } : {}),
-      ...(typeof stored.stopLossPct === 'number' ? { stopLossPct: stored.stopLossPct } : {}),
-      ...(typeof stored.takeProfitPct === 'number'
-        ? { takeProfitPct: stored.takeProfitPct }
-        : {}),
-    }
-  }
-
-  return {
-    ...DEFAULT_BOT,
-    running: stored.running === true,
-    strategy,
-    maxAllocPct:
-      typeof stored.maxAllocPct === 'number' ? stored.maxAllocPct : DEFAULT_BOT.maxAllocPct,
-    classes: Array.isArray(stored.classes)
-      ? stored.classes.filter((c): c is AssetClass => ASSET_CLASSES.includes(c))
-      : DEFAULT_BOT.classes,
-    params: { ...(stored.params ?? {}) },
-    routeToBroker: stored.routeToBroker === true,
-    riskPrefs,
-  }
-}
-
-/**
- * Reads a saved terminal, used both for this browser's storage and for a
- * backup file. Returns null when the text is not a usable save.
- */
-function parseState(raw: string | null): StoredState | null {
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw) as Partial<StoredState>
-    const portfolio = parsed.portfolio
-    if (!portfolio || typeof portfolio.cash !== 'number' || typeof portfolio.holdings !== 'object') {
-      return null
-    }
-    const brokers = Array.isArray(parsed.brokers)
-      ? parsed.brokers.filter(
-          (b): b is BrokerConnection =>
-            !!b && BROKER_DEFS.some((d) => d.kind === (b as BrokerConnection).kind),
-        )
-      : []
-    if (!brokers.some((b) => b.kind === 'paper')) brokers.unshift(paperConnection())
-    const activeBroker = brokers.some((b) => b.id === parsed.activeBroker)
-      ? (parsed.activeBroker as string)
-      : PAPER_BROKER_ID
-    const routes: Partial<Record<AssetClass, string>> = {}
-    const storedRoutes = parsed.routes
-    if (storedRoutes && typeof storedRoutes === 'object') {
-      for (const cls of ASSET_CLASSES) {
-        const id = (storedRoutes as Record<string, unknown>)[cls]
-        if (typeof id === 'string' && brokers.some((b) => b.id === id)) routes[cls] = id
-      }
-    }
-    const exits: ExitBook = {}
-    const storedExits = parsed.exits
-    if (storedExits && typeof storedExits === 'object') {
-      for (const [symbol, raw] of Object.entries(storedExits as Record<string, unknown>)) {
-        const level = raw as Partial<{ stopLoss: number; takeProfit: number }> | null
-        if (
-          level &&
-          typeof level.stopLoss === 'number' &&
-          typeof level.takeProfit === 'number' &&
-          Number.isFinite(level.stopLoss) &&
-          Number.isFinite(level.takeProfit)
-        ) {
-          exits[symbol] = { stopLoss: level.stopLoss, takeProfit: level.takeProfit }
-        }
-      }
-    }
-
-    return {
-      portfolio: { ...startingPortfolio(), ...portfolio },
-      fills: Array.isArray(parsed.fills) ? parsed.fills.slice(0, 160) : [],
-      history: Array.isArray(parsed.history) ? parsed.history.slice(0, 1200) : [],
-      bot: loadBot(parsed.bot),
-      orders: Array.isArray(parsed.orders) ? parsed.orders.slice(0, 40) : [],
-      equity: parseEquity(parsed.equity),
-      brokers,
-      activeBroker,
-      routes,
-      exits,
-    }
-  } catch {
-    return null
-  }
-}
-
-function loadState(): StoredState {
-  return parseState(localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY)) ??
-    emptyState()
-}
-
-/** Backups never carry broker keys, so restored venues ask for them again. */
-function withoutSecrets(state: StoredState): StoredState {
-  return {
-    ...state,
-    brokers: state.brokers.map((b) =>
-      b.kind === 'paper'
-        ? b
-        : { ...b, key: '', secret: '', status: 'error' as const, message: 'Keys are not part of a backup — re-enter them' },
-    ),
-  }
-}
-
 export default function App() {
   const engineRef = useRef<MarketEngine | null>(null)
   if (!engineRef.current) engineRef.current = new MarketEngine()
@@ -344,6 +197,13 @@ export default function App() {
   const portfolioRef = useRef(portfolio)
   const [fills, setFills] = useState<Fill[]>(initial.fills)
   const [tradeHistory, setTradeHistory] = useState<Fill[]>(initial.history)
+  const [auditLog, setAuditLog] = useState<AuditEvent[]>(initial.audit)
+  const auditRef = useRef(auditLog)
+  const [governor, setGovernor] = useState<DayAnchor>(initial.governor)
+  const governorRef = useRef(governor)
+  /** Latest risk verdict and day anchor, refreshed every render for the scan loop. */
+  const riskBlocksRef = useRef<RiskBlock[]>([])
+  const dayAnchorRef = useRef<DayAnchor>(initial.governor)
   const [bot, setBot] = useState<BotConfig>(initial.bot)
   const botRef = useRef(bot)
   const cooldownsRef = useRef<Record<string, number>>({})
@@ -407,6 +267,53 @@ export default function App() {
       cancelled = true
       window.clearInterval(id)
     }
+  }, [engine])
+
+  // A real stream sits in front of that poll: Coinbase's public ticker socket
+  // pushes crypto as it trades, and an SSE bridge you run yourself can cover
+  // stocks and energy, which have no key-less feed the browser may call.
+  const [streamStatus, setStreamStatus] = useState<StreamStatus>({
+    state: 'idle',
+    detail: 'Not connected yet',
+    at: 0,
+  })
+  const [bridgeStatus, setBridgeStatus] = useState<StreamStatus>({
+    state: 'idle',
+    detail: 'No bridge configured',
+    at: 0,
+  })
+  /** Quotes that arrived between two flushes, applied in one batch. */
+  const pendingQuotesRef = useRef<Record<string, QuoteUpdate>>({})
+
+  useEffect(() => {
+    const push = (quotes: Record<string, QuoteUpdate>) => {
+      Object.assign(pendingQuotesRef.current, quotes)
+    }
+    const stopSocket = startCoinbaseStream(CRYPTO_SYMBOLS, {
+      onQuotes: push,
+      onStatus: setStreamStatus,
+    })
+    const bridgeUrl = settings.streamUrl.trim()
+    const stopBridge = bridgeUrl ? startBridgeStream(bridgeUrl, {
+      onQuotes: push,
+      onStatus: setBridgeStatus,
+    }) : () => {}
+    return () => {
+      stopSocket()
+      stopBridge()
+    }
+  }, [settings.streamUrl])
+
+  // Applied on a short clock rather than per frame, so a busy tape cannot
+  // cause a render per trade.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const batch = pendingQuotesRef.current
+      if (Object.keys(batch).length === 0) return
+      pendingQuotesRef.current = {}
+      if (engine.applyLive(batch) > 0) setNow(Date.now())
+    }, 250)
+    return () => window.clearInterval(id)
   }, [engine])
 
   useEffect(() => {
@@ -518,6 +425,21 @@ export default function App() {
     historyRef.current = tradeHistory
   }, [tradeHistory])
 
+  useEffect(() => {
+    auditRef.current = auditLog
+  }, [auditLog])
+
+  /** Appends to the desk log, collapsing a condition that merely persists. */
+  const logEvent = useCallback(
+    (event: { kind: AuditKind; subject?: string; detail: string }) => {
+      const next = noteOnce(auditRef.current, event)
+      if (next === auditRef.current) return
+      auditRef.current = next
+      setAuditLog(next)
+    },
+    [],
+  )
+
   /**
    * Stamps each fresh fill with the model that best explains it — the read on
    * the tape at that moment plus that model's record on this account — so the
@@ -604,18 +526,67 @@ export default function App() {
     }
   }, [syncExits, withMatches])
 
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      engine.tick()
-      tickRef.current += 1
-      setNow(Date.now())
+  /**
+   * One scan of the desk: advance the tape, roll the day, run the bot, fill
+   * resting limits and evaluate stops and targets. It used to live inside the
+   * interval; lifting it out is what lets a wake-up after a background pause
+   * replay the scans it missed.
+   */
+  const step = useCallback(() => {
+    engine.tick()
 
-      if (botRef.current.running) {
-        const venue = botRef.current.routeToBroker
-          ? brokersRef.current.find((b) => b.id === activeBrokerRef.current)
-          : undefined
-        if (settingsRef.current.requireApproval) {
-          // Approval mode: the scan only proposes, the trader decides.
+    tickRef.current += 1
+    setNow(Date.now())
+
+    // Roll the day's equity anchor at local midnight, so the daily loss
+    // limit resets without a reload.
+    if (dayAnchorRef.current.day !== governorRef.current.day) {
+      governorRef.current = dayAnchorRef.current
+      setGovernor(dayAnchorRef.current)
+    }
+
+    const blocks = riskBlocksRef.current
+    const scannedAt = Date.now()
+    /** Asked before every entry; exits are never blocked. */
+    const entryBlock = (ins: Instrument): string | null => {
+      const top = blocks[0]
+      if (top) {
+        logEvent({ kind: 'block', subject: ins.symbol, detail: top.reason })
+        return top.reason
+      }
+      if (marketState(ins.cls) === 'closed') {
+        const why = closedNote(ins.cls)
+        logEvent({ kind: 'session', subject: ins.symbol, detail: why })
+        return why
+      }
+      const maxAge = settingsRef.current.limits.maxQuoteAgeSec * 1000
+      if (quoteStale(ins, scannedAt, maxAge)) {
+        const why = `${ins.symbol} quote is older than ${settingsRef.current.limits.maxQuoteAgeSec}s`
+        logEvent({ kind: 'stale', subject: ins.symbol, detail: why })
+        return why
+      }
+      return null
+    }
+
+    if (botRef.current.running) {
+      const venue = botRef.current.routeToBroker
+        ? brokersRef.current.find((b) => b.id === activeBrokerRef.current)
+        : undefined
+      if (settingsRef.current.requireApproval) {
+        // Approval mode: the scan only proposes, the trader decides.
+        const plan = runBotStep(
+          engine.instruments,
+          portfolioRef.current,
+          botRef.current,
+          cooldownsRef.current,
+          tickRef.current,
+          true,
+          exitsRef.current,
+          entryBlock,
+        )
+        if (plan.intents.length > 0) enqueueProposals(plan.intents)
+      } else if (venue && venue.kind !== 'paper') {
+        if (!routingRef.current) {
           const plan = runBotStep(
             engine.instruments,
             portfolioRef.current,
@@ -624,154 +595,181 @@ export default function App() {
             tickRef.current,
             true,
             exitsRef.current,
+            entryBlock,
           )
-          if (plan.intents.length > 0) enqueueProposals(plan.intents)
-        } else if (venue && venue.kind !== 'paper') {
-          if (!routingRef.current) {
-            const plan = runBotStep(
-              engine.instruments,
-              portfolioRef.current,
-              botRef.current,
-              cooldownsRef.current,
-              tickRef.current,
-              true,
-              exitsRef.current,
-            )
-            if (plan.intents.length > 0) void dispatchBotIntents(plan.intents, venue)
-          }
-        } else {
-          const result = runBotStep(
-            engine.instruments,
-            portfolioRef.current,
-            botRef.current,
-            cooldownsRef.current,
-            tickRef.current,
-            false,
-            exitsRef.current,
-          )
-          if (result.fills.length > 0) {
-            portfolioRef.current = result.portfolio
-            setPortfolio(result.portfolio)
-            setFills((prev) => [...withMatches(result.fills), ...prev].slice(0, 160))
-            syncExits(result.portfolio, result.fills)
-          }
+          if (plan.intents.length > 0) void dispatchBotIntents(plan.intents, venue)
+        }
+      } else {
+        const result = runBotStep(
+          engine.instruments,
+          portfolioRef.current,
+          botRef.current,
+          cooldownsRef.current,
+          tickRef.current,
+          false,
+          exitsRef.current,
+          entryBlock,
+        )
+        if (result.fills.length > 0) {
+          portfolioRef.current = result.portfolio
+          setPortfolio(result.portfolio)
+          setFills((prev) => [...withMatches(result.fills), ...prev].slice(0, 160))
+          syncExits(result.portfolio, result.fills)
         }
       }
+    }
 
-      // resting limit orders: fill when the market trades through the price
-      if (ordersRef.current.some((order) => order.status === 'working')) {
-        let pf = portfolioRef.current
-        const fillsNow: Fill[] = []
-        const next: WorkingOrder[] = ordersRef.current.map((order) => {
-          if (order.status !== 'working') return order
-          const ins = engine.get(order.symbol)
-          if (!ins) return { ...order, status: 'cancelled', note: 'Instrument unavailable' }
-          if (!limitReached(order, ins.price)) return order
-          const result = applyOrder(pf, order.symbol, ins.price, order.side, order.qty)
-          if (!result.ok) return { ...order, status: 'cancelled', note: result.error }
-          pf = result.portfolio
-          fillsNow.push({
-            id: `limit-${order.id}`,
-            ts: Date.now(),
-            symbol: order.symbol,
-            side: order.side,
-            qty: order.qty,
-            price: ins.price,
-            source: 'manual',
-            reason: `Limit order filled at ${fmtPrice(ins.price, ins.dp)}`,
-            pnl: result.pnl,
-          })
-          return { ...order, status: 'filled', note: `Filled at ${fmtPrice(ins.price, ins.dp)}` }
+    // resting limit orders: fill when the market trades through the price
+    if (ordersRef.current.some((order) => order.status === 'working')) {
+      let pf = portfolioRef.current
+      const fillsNow: Fill[] = []
+      const next: WorkingOrder[] = ordersRef.current.map((order) => {
+        if (order.status !== 'working') return order
+        const ins = engine.get(order.symbol)
+        if (!ins) return { ...order, status: 'cancelled', note: 'Instrument unavailable' }
+        if (!limitReached(order, ins.price)) return order
+        const result = applyOrder(pf, order.symbol, ins.price, order.side, order.qty)
+        if (!result.ok) return { ...order, status: 'cancelled', note: result.error }
+        pf = result.portfolio
+        fillsNow.push({
+          id: `limit-${order.id}`,
+          ts: Date.now(),
+          symbol: order.symbol,
+          side: order.side,
+          qty: order.qty,
+          price: ins.price,
+          source: 'manual',
+          reason: `Limit order filled at ${fmtPrice(ins.price, ins.dp)}`,
+          pnl: result.pnl,
         })
-        ordersRef.current = next
-        setOrders(next)
-        if (fillsNow.length > 0) {
-          portfolioRef.current = pf
-          setPortfolio(pf)
-          setFills((prev) => [...withMatches(fillsNow), ...prev].slice(0, 160))
-          syncExits(pf, fillsNow)
-        }
+        return { ...order, status: 'filled', note: `Filled at ${fmtPrice(ins.price, ins.dp)}` }
+      })
+      ordersRef.current = next
+      setOrders(next)
+      if (fillsNow.length > 0) {
+        portfolioRef.current = pf
+        setPortfolio(pf)
+        setFills((prev) => [...withMatches(fillsNow), ...prev].slice(0, 160))
+        syncExits(pf, fillsNow)
       }
+    }
 
-      // attached stops and targets: whatever opened the trade — the bot, a
-      // chart plan, a script or the ticket — it closes when either level hits
-      const book = exitsRef.current
-      if (Object.keys(book).length > 0) {
-        let pf = portfolioRef.current
-        const exitFills: Fill[] = []
-        let nextBook: ExitBook | null = null
-        for (const [symbol, exit] of Object.entries(book)) {
-          const held = pf.holdings[symbol]
-          const ins = engine.get(symbol)
-          if (!held || !ins) {
-            nextBook = { ...(nextBook ?? book) }
-            delete nextBook[symbol]
-            continue
-          }
-          const hit = exitHit(exit, ins.price)
-          if (!hit) continue
-          const result = applyOrder(pf, symbol, ins.price, 'sell', held.qty)
-          if (!result.ok) continue
-          pf = result.portfolio
+    // attached stops and targets: whatever opened the trade — the bot, a
+    // chart plan, a script or the ticket — it closes when either level hits
+    const book = exitsRef.current
+    if (Object.keys(book).length > 0) {
+      let pf = portfolioRef.current
+      const exitFills: Fill[] = []
+      let nextBook: ExitBook | null = null
+      for (const [symbol, exit] of Object.entries(book)) {
+        const held = pf.holdings[symbol]
+        const ins = engine.get(symbol)
+        if (!held || !ins) {
           nextBook = { ...(nextBook ?? book) }
           delete nextBook[symbol]
-          exitFills.push({
-            id: `exit-${Date.now()}-${symbol}`,
-            ts: Date.now(),
-            symbol,
-            side: 'sell',
-            qty: held.qty,
-            price: ins.price,
-            source: 'manual',
-            reason:
-              hit === 'stop'
-                ? `Stop loss hit at ${fmtPrice(ins.price, ins.dp)}`
-                : `Take profit hit at ${fmtPrice(ins.price, ins.dp)}`,
-            pnl: result.pnl,
-          })
+          continue
         }
-        if (nextBook) {
-          exitsRef.current = nextBook
-          setExits(nextBook)
-        }
-        if (exitFills.length > 0) {
-          portfolioRef.current = pf
-          setPortfolio(pf)
-          setFills((prev) => [...exitFills, ...prev].slice(0, 160))
-        }
+        const hit = exitHit(exit, ins.price)
+        if (!hit) continue
+        const result = applyOrder(pf, symbol, ins.price, 'sell', held.qty)
+        if (!result.ok) continue
+        pf = result.portfolio
+        nextBook = { ...(nextBook ?? book) }
+        delete nextBook[symbol]
+        exitFills.push({
+          id: `exit-${Date.now()}-${symbol}`,
+          ts: Date.now(),
+          symbol,
+          side: 'sell',
+          qty: held.qty,
+          price: ins.price,
+          source: 'manual',
+          reason:
+            hit === 'stop'
+              ? `Stop loss hit at ${fmtPrice(ins.price, ins.dp)}`
+              : `Take profit hit at ${fmtPrice(ins.price, ins.dp)}`,
+          pnl: result.pnl,
+        })
       }
+      if (nextBook) {
+        exitsRef.current = nextBook
+        setExits(nextBook)
+      }
+      if (exitFills.length > 0) {
+        portfolioRef.current = pf
+        setPortfolio(pf)
+        setFills((prev) => [...exitFills, ...prev].slice(0, 160))
+      }
+    }
 
-      const equityNow = equityOf(portfolioRef.current)
-      const sampledAt = Date.now()
-      setEquitySeries((prev) => {
-        const lastPoint = prev[prev.length - 1]
-        if (lastPoint && Math.abs(lastPoint.v - equityNow) < 0.005) return prev
-        return [...prev, { t: sampledAt, v: equityNow }].slice(-1200)
-      })
-    }, 900)
-    return () => window.clearInterval(id)
-  }, [engine, equityOf, dispatchBotIntents, enqueueProposals, syncExits])
+    const equityNow = equityOf(portfolioRef.current)
+    const sampledAt = Date.now()
+    setEquitySeries((prev) => {
+      const lastPoint = prev[prev.length - 1]
+      if (lastPoint && Math.abs(lastPoint.v - equityNow) < 0.005) return prev
+      return [...prev, { t: sampledAt, v: equityNow }].slice(-1200)
+    })
+  }, [engine, equityOf, dispatchBotIntents, enqueueProposals, syncExits, logEvent])
+
+  const lastScanRef = useRef(Date.now())
 
   useEffect(() => {
-    try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({
-          portfolio,
-          fills: fills.slice(0, 80),
-          history: tradeHistory.slice(0, 1200),
-          bot,
-          orders: orders.slice(0, 40),
-          equity: equitySeries.slice(-1200),
-          brokers,
-          activeBroker,
-          routes,
-          exits,
-        }),
-      )
-    } catch {
-      // storage is a convenience; the terminal keeps running without it
+    const id = window.setInterval(() => {
+      lastScanRef.current = Date.now()
+      step()
+    }, TICK_MS)
+
+    // Browsers throttle timers in a hidden tab and Android may pause the
+    // WebView outright. On return, replay the scans that were missed so stops,
+    // targets and limits are judged against the tape as it is now — and say so
+    // in the desk log, because a silent gap is indistinguishable from a broken
+    // bot.
+    const onVisibility = () => {
+      if (document.hidden) {
+        logEvent({
+          kind: 'halt',
+          detail: 'Desk went to the background — scans pause here and catch up on return',
+        })
+        return
+      }
+      const plan = catchUp(lastScanRef.current, Date.now())
+      for (let i = 0; i < plan.scans; i += 1) step()
+      lastScanRef.current = Date.now()
+      logEvent({
+        kind: 'resume',
+        detail:
+          plan.scans > 0
+            ? `Caught up ${plan.scans} scan${plan.scans === 1 ? '' : 's'} after ${humanSpan(
+                plan.stalledMs,
+              )} in the background`
+            : `Back in the foreground after ${humanSpan(plan.stalledMs)}`,
+      })
     }
+
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.clearInterval(id)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [step, logEvent])
+
+  // The whole desk, written to this browser on every change. The storage
+  // module keeps a known-good fallback copy behind it.
+  useEffect(() => {
+    saveDesk({
+      portfolio,
+      fills,
+      history: tradeHistory,
+      bot,
+      orders,
+      equity: equitySeries,
+      brokers,
+      activeBroker,
+      routes,
+      exits,
+      audit: auditLog,
+      governor,
+    })
   }, [
     portfolio,
     fills,
@@ -783,6 +781,8 @@ export default function App() {
     activeBroker,
     routes,
     exits,
+    auditLog,
+    governor,
   ])
 
   const instrument = engine.get(selected) ?? engine.instruments[0]
@@ -804,6 +804,16 @@ export default function App() {
   const activeBrokerConn =
     brokers.find((b) => b.id === activeBrokerRef.current) ?? paperConnection()
 
+  const quotePrices: Record<string, number> = {}
+  for (const ins of engine.instruments) quotePrices[ins.symbol] = ins.price
+  const riskRows = holdingRows.map((row) => ({
+    symbol: row.instrument.symbol,
+    cls: row.instrument.cls,
+    value: row.value,
+    qty: row.holding.qty,
+    price: row.instrument.price,
+  }))
+
   /** What the last quote pull reached and what it could not, for the feed badge. */
   const feedTitle = (() => {
     if (quoteFeed.at === 0) return 'Waiting for the first live quote pull'
@@ -814,10 +824,41 @@ export default function App() {
     if (quoteFeed.failed.length > 0) {
       lines.push('Feed errors:', ...quoteFeed.failed.map((f) => `· ${f}`))
     }
+    lines.push(`Crypto stream — ${streamStatus.detail}`)
+    if (settings.streamUrl.trim()) lines.push(`Your bridge — ${bridgeStatus.detail}`)
     lines.push('Stocks and energy have no free key-less feed, so they stay simulated.')
     return lines.join('\n')
   })()
-  const feedFailed = quoteFeed.failed.length
+  const feedFailed = quoteFeed.failed.length + (streamStatus.state === 'error' ? 1 : 0)
+  const feedLive = quoteFeed.live > 0 || streamStatus.state === 'live'
+  const feedBadge =
+    activeBrokerConn.kind !== 'paper'
+      ? `${activeBrokerConn.label} linked`
+      : quoteFeed.live > 0
+        ? `${quoteFeed.live} live quotes${feedFailed > 0 ? ` · ${feedFailed} feed errors` : ''}`
+        : feedFailed > 0
+          ? `${feedFailed} feed errors`
+          : 'Simulated feed'
+
+  // The risk governor, evaluated from live state so the banner and the scan
+  // loop always agree. Only entries are ever blocked; exits keep running.
+  const records = strategyRecords(tradeHistory)
+  const dayAnchor = rollDay(governor, equity, now)
+  const armedModel = STRATEGIES.find((s) => s.id === bot.strategy) ?? STRATEGIES[0]
+  const riskBlocks = evaluateRisk({
+    equity,
+    startEquity: dayAnchor.startEquity,
+    exposurePct: equity > 0 ? (positionsValue / equity) * 100 : 0,
+    positions: holdingRows.length,
+    tradesToday: entriesToday(tradeHistory, now),
+    losingStreak: consecutiveLosses(tradeHistory),
+    strategy: { id: armedModel.id, name: armedModel.name, record: records[armedModel.id] },
+    auto: !settings.requireApproval,
+    limits: settings.limits,
+  })
+  riskBlocksRef.current = riskBlocks
+  dayAnchorRef.current = dayAnchor
+  const dayChangePct = dayAnchor.startEquity > 0 ? (equity / dayAnchor.startEquity - 1) * 100 : 0
 
   /**
    * Routes orders to a venue and remembers it for the asset class of the
@@ -1234,6 +1275,33 @@ export default function App() {
     setBot((prev) => ({ ...prev, running: true }))
   }
 
+  // Hold the screen awake while the bot is armed. Wake Lock is the closest a
+  // web build gets to a foreground service: without it Android is free to
+  // suspend the WebView, and replaying missed scans is all that is left.
+  useEffect(() => {
+    if (!autoOn) return
+    let handle: { release: () => Promise<void> } | null = null
+    let cancelled = false
+    void requestWakeLock().then((acquired) => {
+      if (cancelled) {
+        void acquired?.release()
+        return
+      }
+      handle = acquired
+      if (!acquired) {
+        logEvent({
+          kind: 'feed',
+          detail:
+            'This browser will not hold the screen awake — background scans are replayed on return',
+        })
+      }
+    })
+    return () => {
+      cancelled = true
+      void handle?.release()
+    }
+  }, [autoOn, logEvent])
+
   /** Puts a whole saved terminal in place, refs included, so the next tick sees it. */
   const applyState = (next: StoredState) => {
     portfolioRef.current = next.portfolio
@@ -1253,6 +1321,10 @@ export default function App() {
     setRoutes(next.routes)
     exitsRef.current = next.exits
     setExits(next.exits)
+    auditRef.current = next.audit
+    setAuditLog(next.audit)
+    governorRef.current = next.governor
+    setGovernor(next.governor)
     cooldownsRef.current = {}
   }
 
@@ -1268,6 +1340,8 @@ export default function App() {
       activeBroker,
       routes,
       exits,
+      audit: auditLog.slice(0, 120),
+      governor,
     })
     const blob = new Blob(
       [JSON.stringify({ app: 'kestrel', version: 1, savedAt: new Date().toISOString(), state: saved }, null, 2)],
@@ -1341,81 +1415,22 @@ export default function App() {
 
   return (
     <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand__mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" width="17" height="17">
-              <path d="M13 3 5 14h6l-1 7 8-11h-6Z" fill="currentColor" />
-            </svg>
-          </span>
-          <div>
-            <div className="brand__name">Kestrel</div>
-            <div className="brand__sub">Paper desk · Broker bridge</div>
-          </div>
-        </div>
-        <div className="topbar__right">
-          <button
-            className={`autoexec ${autoOn ? 'is-on' : ''}`}
-            onClick={toggleAutoExecute}
-            aria-pressed={autoOn}
-            title={
-              autoOn
-                ? 'Stop auto execution and go back to approving proposals'
-                : 'Run the bot and book every signal without asking'
-            }
-          >
-            <i aria-hidden="true" />
-            Auto execute
-          </button>
-          <span className={`topbar__bot ${bot.running ? 'is-on' : ''}`}>
-            <i aria-hidden="true" />
-            {bot.running ? 'Bot scanning' : 'Bot paused'}
-          </span>
-          <span
-            className={`topbar__badge${
-              feedFailed > 0 ? ' is-warn' : quoteFeed.live > 0 ? ' is-live' : ''
-            }`}
-            title={feedTitle}
-          >
-            {activeBrokerConn.kind === 'paper'
-              ? quoteFeed.live > 0
-                ? `${quoteFeed.live} live quotes${feedFailed > 0 ? ` · ${feedFailed} feed errors` : ''}`
-                : feedFailed > 0
-                  ? `${feedFailed} feed errors`
-                  : 'Simulated feed'
-              : `${activeBrokerConn.label} linked`}
-          </span>
-          <span className="topbar__clock">{clock}</span>
-          <span className="topbar__equity-block">
-            <span className="topbar__equity-label">Equity · paper</span>
-            <strong className="topbar__equity">{money(equity)}</strong>
-            <span
-              className={`topbar__equity-delta ${equity >= portfolio.deposited ? 'up' : 'down'}`}
-            >
-              {signedPct(((equity - portfolio.deposited) / portfolio.deposited) * 100)} today
-            </span>
-          </span>
-          <button
-            className={`topbar__gear ${view === 'settings' ? 'is-active' : ''}`}
-            aria-label="Settings"
-            aria-pressed={view === 'settings'}
-            onClick={() => setView('settings')}
-          >
-            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-              <circle cx="12" cy="12" r="3.4" fill="none" stroke="currentColor" strokeWidth="1.6" />
-              <path
-                d="M19.2 13.6a7.6 7.6 0 0 0 0-3.2l1.7-1.2-1.7-3-1.9.8a7.4 7.4 0 0 0-2.7-1.6L14.3 3h-3.4l-.3 2.4A7.4 7.4 0 0 0 7.9 7l-1.9-.8-1.7 3 1.6 1.2a7.6 7.6 0 0 0 0 3.2L4.3 14.8l1.7 3 1.9-.8a7.4 7.4 0 0 0 2.7 1.6l.3 2.4h3.4l.3-2.4a7.4 7.4 0 0 0 2.7-1.6l1.9.8 1.7-3-1.7-1.2Z"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.3"
-                strokeLinejoin="round"
-              />
-            </svg>
-            <span className="topbar__gear-name">{profile.name.split(' ')[0]}</span>
-            {pendingCount > 0 && <span className="topbar__gear-dot" aria-hidden="true" />}
-          </button>
-        </div>
-      </header>
+      <Topbar
+        autoOn={autoOn}
+        onToggleAuto={toggleAutoExecute}
+        botRunning={bot.running}
+        clock={clock}
+        feedBadge={feedBadge}
+        feedTitle={feedTitle}
+        feedWarn={feedFailed > 0 || streamStatus.state === 'error'}
+        feedLive={feedLive}
+        equity={equity}
+        deposited={portfolio.deposited}
+        pendingCount={pendingCount}
+        settingsActive={view === 'settings'}
+        onOpenSettings={() => setView('settings')}
+        name={profile.name}
+      />
 
       <div className="terminal">
         <aside className="col col--left">
@@ -1429,6 +1444,16 @@ export default function App() {
         </aside>
 
         <main className="col col--mid" ref={mainRef}>
+          {riskBlocks.length > 0 && (
+            <div className="riskbar" role="status">
+              <strong>Entries paused</strong>
+              <span>{riskBlocks[0].reason}</span>
+              {riskBlocks.length > 1 && (
+                <span className="riskbar__more">+{riskBlocks.length - 1} more limit breached</span>
+              )}
+              <span className="riskbar__note">Stops, targets and exits still run.</span>
+            </div>
+          )}
           {view === 'trade' && (
             <div className="view view--trade">
               <div className="market">
@@ -1596,8 +1621,12 @@ export default function App() {
                       fills={tradeHistory}
                       startTs={sessionStart}
                       deposited={portfolio.deposited}
+                      symbol={instrument.symbol}
                     />
                   </section>
+                  <AnalyticsPanel fills={tradeHistory} points={equitySeries} />
+                  <DeskLog events={auditLog} dayChangePct={dayChangePct} />
+                  <RiskPanel rows={riskRows} equity={equity} quotes={quotePrices} />
                   <AccountPanel
                     portfolio={portfolio}
                     equity={equity}
@@ -1672,6 +1701,7 @@ export default function App() {
                 onRemove={removeBroker}
                 onRoute={routeBroker}
               />
+              <Reconciliation fills={tradeHistory} />
             </div>
           )}
 
