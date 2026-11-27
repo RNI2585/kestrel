@@ -178,7 +178,7 @@ export const BROKER_DEFS: BrokerDef[] = [
     blurb:
       'Trades a real PrimeXBT account through the signing bridge. The terminal only holds the bridge URL and its token — the PrimeXBT key id and Ed25519 secret stay on the bridge, so they never reach this browser.',
     auth: 'bearer',
-    defaultEndpoint: 'https://kestrel-primexbt-bridge-ymtwnj-preview.freebuff.site',
+    defaultEndpoint: 'https://kestrel-primexbt-bridge-ymtwnj.freebuff.site',
     accountPath: '/account',
     orderPath: '/orders',
     keyLabel: 'Bridge token',
