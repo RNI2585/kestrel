@@ -1433,6 +1433,35 @@ h3 {
   margin-top: 8px;
 }
 
+.broker__venue {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+
+.broker__venue .broker__note {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.broker__position {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--bone);
+}
+
 .broker__btn {
   display: inline-flex;
   align-items: center;

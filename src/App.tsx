@@ -1211,6 +1211,8 @@ export default function App() {
             return { ok: false, error: message }
           }
           fillQty = routed.filledQty
+          // Use the venue's per-order average fill instead of a position-level
+          // average that may include earlier trades.
           fillPrice = routed.averagePrice
           fillId = routed.orderId
           if (routed.status === 'partial') {

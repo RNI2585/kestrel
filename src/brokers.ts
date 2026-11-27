@@ -7,6 +7,7 @@ export type BrokerKind =
   | 'bybit'
   | 'kraken'
   | 'primexbt'
+  | 'primexbt-bridge'
   | 'binance'
   | 'custom'
 
@@ -26,6 +27,8 @@ export interface BrokerDef {
   orderPath: string
   keyLabel: string
   secretLabel: string
+  /** The second credential is optional, so Connect can be tried with just the key. */
+  secretOptional?: boolean
   secretHint: string
   docsUrl: string
   /** Which of the terminal's instruments this venue actually lists. */
@@ -167,7 +170,7 @@ export const BROKER_DEFS: BrokerDef[] = [
     auth: 'primexbt',
     defaultEndpoint: 'https://www.primexbt.partners',
     accountPath: '/v3/trading/account',
-    orderPath: '/v3/trading/orders/market',
+    orderPath: '/v3/trading/orders/market/place',
     keyLabel: 'Key id',
     secretLabel: 'Secret key',
     secretHint: 'The base64 PKCS8 Ed25519 secret shown once when the key was created.',
@@ -191,6 +194,24 @@ export const BROKER_DEFS: BrokerDef[] = [
     coverage: 'Spot BTCUSDT, ETHUSDT, SOLUSDT.',
   },
   {
+    kind: 'primexbt-bridge',
+    name: 'PrimeXBT via bridge',
+    group: 'Custom',
+    blurb:
+      'Trades a real PrimeXBT account through the signing bridge. The terminal only holds the bridge URL and its token — the PrimeXBT key id and Ed25519 secret stay on the bridge, so they never reach this browser.',
+    auth: 'bearer',
+    defaultEndpoint: 'https://kestrel-primexbt-bridge-ymtwnj.freebuff.site',
+    accountPath: '/account',
+    orderPath: '/orders',
+    keyLabel: 'Bridge token',
+    secretLabel: 'Second key',
+    secretOptional: true,
+    secretHint:
+      'Bridge token: the BRIDGE_TOKEN stored as a secret on the bridge deployment, sent as a bearer token. This is not your PrimeXBT key id. Second key: only needed when the bridge also sets BRIDGE_SECRET, where it is sent as X-Bridge-Key. Leave it blank otherwise.',
+    docsUrl: '',
+    coverage: 'BTC/USD, ETH/USD, SOL/USD, as forwarded by the bridge.',
+  },
+  {
     kind: 'custom',
     name: 'Custom bridge',
     group: 'Custom',
@@ -201,8 +222,10 @@ export const BROKER_DEFS: BrokerDef[] = [
     accountPath: '/account',
     orderPath: '/orders',
     keyLabel: 'Bearer token',
-    secretLabel: '',
-    secretHint: 'Sent as an Authorization header.',
+    secretLabel: 'Second key',
+    secretOptional: true,
+    secretHint:
+      'Optional. Sent as an X-Bridge-Key header, for a bridge that wants a second credential alongside the bearer token. Leave blank if your bridge only checks the token.',
     docsUrl: '',
     coverage: 'Whatever your bridge accepts.',
   },
@@ -218,9 +241,16 @@ const VENUE_PAIRS: Partial<Record<BrokerKind, Record<string, string>>> = {
   binance: { BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT' },
   kraken: { BTC: 'XBTUSD', ETH: 'ETHUSD', SOL: 'SOLUSD' },
   primexbt: { BTC: 'BTC/USD', ETH: 'ETH/USD', SOL: 'SOL/USD' },
+  'primexbt-bridge': { BTC: 'BTC/USD', ETH: 'ETH/USD', SOL: 'SOL/USD' },
 }
 
-const STRICT_VENUES: BrokerKind[] = ['bybit', 'binance', 'kraken', 'primexbt']
+const STRICT_VENUES: BrokerKind[] = [
+  'bybit',
+  'binance',
+  'kraken',
+  'primexbt',
+  'primexbt-bridge',
+]
 
 /**
  * The terminal's symbol translated into the venue's instrument name, or null
@@ -322,9 +352,10 @@ interface BuiltRequest {
   init: RequestInit
 }
 
-function bearerHeaders(key: string): Record<string, string> {
+function bearerHeaders(key: string, second = ''): Record<string, string> {
   const headers: Record<string, string> = {}
   if (key) headers.Authorization = `Bearer ${key}`
+  if (second.trim()) headers['X-Bridge-Key'] = second.trim()
   return headers
 }
 
@@ -485,7 +516,13 @@ async function buildAccountRequest(conn: BrokerConnection, def: BrokerDef): Prom
     case 'primexbt':
       return primexbtRequest(conn, base, path, 'GET', null)
     default:
-      return { url: `${base}${path}`, init: { method: 'GET', headers: bearerHeaders(conn.key.trim()) } }
+      return {
+        url: `${base}${path}`,
+        init: {
+          method: 'GET',
+          headers: bearerHeaders(conn.key.trim(), conn.secret),
+        },
+      }
   }
 }
 
@@ -560,7 +597,7 @@ async function buildOrderRequest(
           method: 'POST',
           headers: {
             'content-type': 'application/json',
-            ...bearerHeaders(conn.key.trim()),
+            ...bearerHeaders(conn.key.trim(), conn.secret),
           },
           body: JSON.stringify({
             symbol,
@@ -689,7 +726,157 @@ function failureHint(conn: BrokerConnection, def: BrokerDef, err: unknown): stri
   if (err instanceof DOMException && err.name === 'AbortError') {
     return `${def.name} did not answer in time.`
   }
+  if (def.auth === 'primexbt') {
+    return `PrimeXBT refuses direct browser calls (CORS), so the signed request never got out. Use the PrimeXBT via bridge card instead — it sends your bridge token to a Worker that signs for you, with account path /account and order path /orders.`
+  }
   return `${conn.label} could not be reached from this browser. Most exchanges block direct calls with CORS — run a small bridge at ${endpointOf(conn) || 'an endpoint you control'} and point this connection at it.`
+}
+
+/**
+ * What a bridge reports about itself. Health is deliberately unauthenticated on
+ * the bridge, so this can say which secrets are missing before a token is even
+ * tried.
+ */
+export interface BridgeHealth {
+  bridge?: string
+  venue?: string
+  configured?: Record<string, boolean>
+  limits?: { symbols?: string[]; maxNotional?: number | null; rateLimitPerMinute?: number }
+  routes?: Record<string, string>
+  error?: string
+}
+
+export async function probeBridge(conn: BrokerConnection): Promise<string> {
+  const base = endpointOf(conn)
+  if (!base) return 'Add the bridge endpoint first.'
+  try {
+    const res = await withTimeout(`${base}/health`, { method: 'GET' })
+    const body = safeJson(await res.text()) as BridgeHealth | null
+    if (!res.ok || !body) return `The bridge answered ${res.status} without a health body.`
+    if (body.error) return `The bridge reported: ${body.error}`
+    const conf = body.configured ?? {}
+    const ready = conf.key && conf.secret && conf.token
+    const parts = Object.entries(conf).map(([name, on]) => `${name}: ${on ? 'set' : 'missing'}`)
+    const cap = body.limits?.maxNotional
+    const limit = body.limits?.rateLimitPerMinute
+    return [
+      `${body.bridge ?? 'Bridge'} ${ready ? 'is ready' : 'is not ready'} — ${parts.join(', ')}`,
+      cap ? `cap $${cap} per order` : 'no notional cap',
+      limit ? `${limit} req/min` : '',
+      body.limits?.symbols?.length ? body.limits.symbols.slice(0, 6).join(' ') : '',
+    ]
+      .filter(Boolean)
+      .join(' · ')
+  } catch (err) {
+    return failureHint(conn, defineBroker(conn.kind), err)
+  }
+}
+
+/** One open position on the venue, as far as the bridge's JSON allows. */
+export interface VenuePosition {
+  id: string
+  symbol: string
+  side: string
+  qty: number
+}
+
+function pick(source: Record<string, unknown>, names: string[]): unknown {
+  for (const name of names) {
+    const value = source[name]
+    if (value !== undefined && value !== null && value !== '') return value
+  }
+  return undefined
+}
+
+function positionList(json: unknown): Record<string, unknown>[] {
+  if (!json || typeof json !== 'object') return []
+  const body = json as Record<string, unknown>
+  for (const key of ['positions', 'data', 'result', 'items']) {
+    const value = body[key]
+    if (Array.isArray(value)) return value.filter((v): v is Record<string, unknown> => !!v && typeof v === 'object')
+    if (value && typeof value === 'object') {
+      const nested = positionList(value)
+      if (nested.length > 0) return nested
+    }
+  }
+  return []
+}
+
+export async function readVenuePositions(conn: BrokerConnection): Promise<VenuePosition[]> {
+  const base = endpointOf(conn)
+  if (!base) return []
+  const res = await withTimeout(`${base}/positions`, {
+    method: 'GET',
+    headers: bearerHeaders(conn.key.trim(), conn.secret),
+  })
+  if (!res.ok) return []
+  const json = safeJson(await res.text())
+  return positionList(json).map((row, index) => {
+    const symbol = String(pick(row, ['symbol', 'pair', 'instrument', 'market']) ?? '—')
+    const rawQty = pick(row, ['qty', 'quantity', 'size', 'amount', 'volume'])
+    const qty = Number(rawQty)
+    return {
+      id: String(pick(row, ['id', 'positionId', 'position_id']) ?? `${symbol}-${index}`),
+      symbol,
+      side: String(pick(row, ['side', 'direction', 'type']) ?? '—'),
+      qty: Number.isFinite(qty) ? qty : 0,
+    }
+  })
+}
+
+/** Asks the bridge to close one position. */
+export async function closeVenuePosition(
+  conn: BrokerConnection,
+  position: VenuePosition,
+): Promise<{ ok: boolean; message: string }> {
+  const base = endpointOf(conn)
+  if (!base) return { ok: false, message: 'No bridge endpoint set.' }
+  try {
+    const res = await withTimeout(`${base}/close`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...bearerHeaders(conn.key.trim(), conn.secret) },
+      body: JSON.stringify({
+        symbol: position.symbol,
+        positionId: position.id,
+        ...(position.qty > 0 ? { qty: position.qty } : {}),
+      }),
+    })
+    const body = safeJson(await res.text())
+    if (!res.ok) {
+      const detail = venueError(body)
+      return { ok: false, message: `Close refused (${res.status})${detail ? ` — ${detail}` : ''}.` }
+    }
+    return { ok: true, message: `Close sent for ${position.symbol}.` }
+  } catch (err) {
+    return { ok: false, message: failureHint(conn, defineBroker(conn.kind), err) }
+  }
+}
+
+/**
+ * The venue's own entry price for a symbol, when the bridge exposes positions
+ * in a shape this can read. Null means the terminal keeps its reference price.
+ */
+export async function venueFillPrice(
+  conn: BrokerConnection,
+  symbol: string,
+): Promise<number | null> {
+  const base = endpointOf(conn)
+  if (!base) return null
+  const wanted = venueSymbol(conn.kind, symbol) ?? symbol
+  try {
+    const res = await withTimeout(`${base}/positions`, {
+      method: 'GET',
+      headers: bearerHeaders(conn.key.trim(), conn.secret),
+    })
+    if (!res.ok) return null
+    const rows = positionList(safeJson(await res.text()))
+    const row = rows.find((r) => String(pick(r, ['symbol', 'pair', 'instrument', 'market']) ?? '') === wanted)
+    if (!row) return null
+    const price = Number(pick(row, ['entryPrice', 'avgPrice', 'averagePrice', 'openPrice', 'price']))
+    return Number.isFinite(price) && price > 0 ? price : null
+  } catch {
+    return null
+  }
 }
 
 /**

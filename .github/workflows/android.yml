@@ -1,0 +1,66 @@
+name: Android APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # The hosted runner ships an Android SDK; accept its licenses and add the
+      # platform/build-tools this project compiles against.
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null
+          "$sdkmanager" --install "platforms;android-36" "build-tools;36.0.0"
+
+      - run: npm ci
+
+      # The APK is only worth shipping if the code behind it compiles and the
+      # desk's own tests pass, so both run before Gradle.
+      - name: Typecheck, unit tests and bridge smoke check
+        run: |
+          npm run typecheck
+          npm test
+          node bridge/smoke.mjs
+
+      - name: Build web assets and sync Android project
+        run: npm run android:sync
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon
+        working-directory: android
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kestrel-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      # A stable download URL for the phone: every push replaces the asset on
+      # this rolling release instead of piling up tags.
+      - name: Publish the APK to the rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-latest
+          name: Kestrel debug APK
+          body: Built from ${{ github.sha }} by the Android APK workflow.
+          files: android/app/build/outputs/apk/debug/app-debug.apk
+          make_latest: true
