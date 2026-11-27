@@ -34,7 +34,10 @@ export default function ScanPanel({ instruments, bot, tick, onOpen }: Props) {
         <div>
           <h1 className="view__title">Market scan</h1>
           <p className="view__sub">
-            Every market ranked by how many strategies agree — the bot trades {armed}.
+            Every market ranked by strategy agreement, with a regime-based strategy fit.{' '}
+            {bot.strategyMode === 'market-fit'
+              ? 'The bot selects a strategy per market.'
+              : `The bot trades ${armed}.`}
           </p>
         </div>
         <span className="view__meta">
@@ -89,6 +92,16 @@ export default function ScanPanel({ instruments, bot, tick, onOpen }: Props) {
                   {row.bias}
                 </span>
                 <span className="scan__regime">{row.regime}</span>
+                <span
+                  className="scan__fit"
+                  title={row.recommendation.reason}
+                >
+                  {row.recommendation.strategy
+                    ? `${STRATEGIES.find((s) => s.id === row.recommendation.strategy)?.name} · ${
+                        instrument.historyVerified ? 'verified bars' : 'paper only'
+                      }`
+                    : 'No aligned setup'}
+                </span>
               </span>
 
               <span className="scan__score-wrap">
@@ -129,9 +142,10 @@ export default function ScanPanel({ instruments, bot, tick, onOpen }: Props) {
 
       <p className="scan__legend">
         Score is the share of the strategies in scope pointing the same way, from 0 (all bearish)
-        to 100 (all bullish). The pip model only covers FX and crypto. Hover or long-press a vote
-        for the strategy's reason. Tap a row to open it on the trade screen with its chart and
-        ticket. Arm a model and tune it in the Strategies tab.
+        to 100 (all bullish). Strategy fit is a heuristic, not a profitability forecast. Chart
+        history is simulated, so these fits are for paper research only; broker-routed bot entries
+        require verified bars. The pip model only covers FX and crypto. Hover or long-press a vote
+        for the strategy's reason. Tap a row to open it on the trade screen.
       </p>
     </div>
   )

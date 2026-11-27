@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   DEFAULT_RISK_LIMITS,
+  checkBotEntry,
   clampLimits,
   consecutiveLosses,
   dayKey,
@@ -10,6 +11,7 @@ import {
   newDayAnchor,
   rollDay,
 } from '../risk'
+import type { Instrument } from '../market'
 import type { Fill } from '../trade'
 
 const fill = (over: Partial<Fill>): Fill => ({
@@ -34,6 +36,36 @@ const base = {
   strategy: { id: 'momentum' as const, name: 'Momentum' },
   auto: false,
   limits: DEFAULT_RISK_LIMITS,
+}
+
+const entryInstrument: Instrument = {
+  symbol: 'BTC',
+  name: 'Bitcoin',
+  cls: 'Crypto',
+  dp: 2,
+  price: 100,
+  prevClose: 99,
+  history: [99, 100],
+  vol: 0.01,
+  base: 100,
+  live: false,
+  historyVerified: false,
+}
+
+const entryInput = {
+  instrument: entryInstrument,
+  proposedNotional: 100,
+  currentClassExposure: 100,
+  currentExposure: 100,
+  currentPositions: 1,
+  tradesToday: 0,
+  opensPosition: true,
+  equity: 1_000,
+  limits: DEFAULT_RISK_LIMITS,
+  riskBlocks: [],
+  now: Date.UTC(2026, 10, 27, 15),
+  requiresVerifiedHistory: false,
+  requiresLiveQuote: false,
 }
 
 describe('the day anchor', () => {
@@ -79,6 +111,83 @@ describe('counting the day', () => {
 describe('evaluateRisk', () => {
   it('passes a desk inside every limit', () => {
     expect(evaluateRisk(base)).toEqual([])
+  })
+
+  describe('bot entry revalidation', () => {
+    it('passes entries inside account, session and quote limits', () => {
+      expect(checkBotEntry(entryInput)).toBeNull()
+    })
+
+    it('keeps new entries blocked by the current account risk verdict', () => {
+      const riskBlock = { code: 'daily-loss' as const, reason: 'Daily loss limit reached' }
+      expect(checkBotEntry({ ...entryInput, riskBlocks: [riskBlock] })).toEqual({
+        kind: 'block',
+        reason: riskBlock.reason,
+      })
+    })
+
+    it('applies asset-class caps to reserved and current exposure', () => {
+      expect(
+        checkBotEntry({
+          ...entryInput,
+          currentClassExposure: 250,
+          reservedClassExposure: 100,
+        }),
+      ).toEqual({
+        kind: 'block',
+        reason: 'Crypto exposure would exceed the 40% asset-class cap',
+      })
+    })
+
+    it('reserves account exposure, open-position slots and daily entries across a scan batch', () => {
+      expect(
+        checkBotEntry({
+          ...entryInput,
+          currentExposure: 650,
+          reservedExposure: 100,
+        })?.reason,
+      ).toContain('account cap')
+      expect(
+        checkBotEntry({
+          ...entryInput,
+          currentPositions: DEFAULT_RISK_LIMITS.maxPositions,
+        })?.reason,
+      ).toContain('position slots are full')
+      expect(
+        checkBotEntry({
+          ...entryInput,
+          tradesToday: DEFAULT_RISK_LIMITS.maxTradesPerDay - 1,
+          reservedTradesToday: 1,
+        })?.reason,
+      ).toContain('entries taken today')
+    })
+
+    it('requires verified bars and fresh live quotes when routing bot entries externally', () => {
+      expect(checkBotEntry({ ...entryInput, requiresVerifiedHistory: true })?.kind).toBe('stale')
+
+      const staleInstrument: Instrument = {
+        ...entryInstrument,
+        live: true,
+        liveAt: entryInput.now - 181_000,
+      }
+      expect(
+        checkBotEntry({
+          ...entryInput,
+          instrument: staleInstrument,
+          requiresLiveQuote: true,
+        })?.reason,
+      ).toContain('older than 180s')
+    })
+
+    it('refuses buys while the instrument market is closed', () => {
+      const stock: Instrument = { ...entryInstrument, symbol: 'AAPL', cls: 'Stocks' }
+      const gate = checkBotEntry({
+        ...entryInput,
+        instrument: stock,
+        now: Date.UTC(2026, 10, 27, 12),
+      })
+      expect(gate?.kind).toBe('session')
+    })
   })
 
   it('pauses entries when the day is down past its loss limit', () => {

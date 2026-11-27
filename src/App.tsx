@@ -1,15 +1,19 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   CLASS_COLOR,
   CRYPTO_SYMBOLS,
   MarketEngine,
   changePct,
+  pipSize,
   type AssetClass,
   type Instrument,
   type QuoteUpdate,
 } from './market'
 import {
   STRATEGIES,
+  defaultParams,
+  indicatorReadings,
+  matchStrategyToMarket,
   patchRisk,
   riskFor,
   runBotStep,
@@ -35,7 +39,6 @@ import {
   PAPER_BROKER_ID,
   paperConnection,
   submitBrokerOrder,
-  venueFillPrice,
   venueSymbol,
   type BrokerConnection,
 } from './brokers'
@@ -45,13 +48,14 @@ import { fetchLiveQuotes } from './liveQuotes'
 import { matchFill, strategyRecords } from './match'
 import {
   consecutiveLosses,
+  checkBotEntry,
   entriesToday,
   evaluateRisk,
   rollDay,
   type DayAnchor,
   type RiskBlock,
 } from './risk'
-import { closedNote, marketState, quoteStale } from './session'
+import { quoteStale } from './session'
 import { noteOnce, type AuditEvent, type AuditKind } from './audit'
 import type { EquityPoint } from './timeline'
 import {
@@ -90,7 +94,15 @@ import Topbar from './components/Topbar'
 import AnalyticsPanel from './components/AnalyticsPanel'
 import RiskPanel from './components/RiskPanel'
 import Reconciliation from './components/Reconciliation'
-import { loadState, parseState, saveDesk, withoutSecrets, type StoredState } from './storage'
+import {
+  DESK_STORAGE_KEY,
+  MAX_BACKUP_SIZE,
+  loadState,
+  parseState,
+  saveDesk,
+  withoutSecrets,
+  type StoredState,
+} from './storage'
 import { catchUp, humanSpan, requestWakeLock, TICK_MS } from './scheduler'
 import {
   startBridgeStream,
@@ -194,6 +206,7 @@ export default function App() {
   const engine = engineRef.current
 
   const [initial] = useState(loadState)
+  const [storageWarning, setStorageWarning] = useState(false)
   const [portfolio, setPortfolio] = useState<Portfolio>(initial.portfolio)
   const portfolioRef = useRef(portfolio)
   const [fills, setFills] = useState<Fill[]>(initial.fills)
@@ -227,6 +240,7 @@ export default function App() {
   const [activeBroker, setActiveBroker] = useState<string>(initial.activeBroker)
   const activeBrokerRef = useRef(activeBroker)
   const routingRef = useRef(false)
+  const pendingBrokerExitsRef = useRef(new Set<string>())
   const [routes, setRoutes] = useState<Partial<Record<AssetClass, string>>>(initial.routes)
   const routesRef = useRef(routes)
 
@@ -244,6 +258,18 @@ export default function App() {
   const settingsRef = useRef(settings)
   const [proposals, setProposals] = useState<Proposal[]>([])
   const proposalsRef = useRef(proposals)
+  const approvingProposalIdsRef = useRef(new Set<string>())
+  const approvalReservationsRef = useRef(
+    new Map<string, { assetClass: AssetClass; notional: number; opensPosition: boolean }>(),
+  )
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === DESK_STORAGE_KEY || event.key === null) setStorageWarning(true)
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
 
   // Live quotes: crypto from Coinbase, spot metals from gold-api and the daily
   // FX fix from open.er-api, all key-less and open to the browser. Stocks and
@@ -462,7 +488,7 @@ export default function App() {
 
   /**
    * Sends the bot's proposed orders to the routed venue one by one and books
-   * only the ones the venue accepts. One batch is in flight at a time so a slow
+   * only fills the venue confirms. One batch is in flight at a time so a slow
    * venue cannot pile up duplicate orders.
    */
   const dispatchBotIntents = useCallback(async (intents: BotIntent[], conn: BrokerConnection) => {
@@ -483,20 +509,57 @@ export default function App() {
         lastMessage = routed.message
         if (!routed.ok) {
           failed = true
+          logEvent({ kind: 'order', subject: intent.symbol, detail: routed.message })
           continue
         }
-        const result = applyOrder(pf, intent.symbol, intent.price, intent.side, intent.qty)
-        if (!result.ok) continue
+        if (routed.status === 'accepted') {
+          logEvent({ kind: 'order', subject: intent.symbol, detail: routed.message })
+          continue
+        }
+        if (!routed.filledQty || !routed.averagePrice) {
+          failed = true
+          logEvent({
+            kind: 'order',
+            subject: intent.symbol,
+            detail: 'The venue response lacked confirmed fill details; check the venue before retrying.',
+          })
+          continue
+        }
+        if (routed.status === 'partial') {
+          logEvent({
+            kind: 'order',
+            subject: intent.symbol,
+            detail: `${routed.message} The remaining quantity is not tracked here; reconcile it at the venue.`,
+          })
+        }
+        const result = applyOrder(
+          pf,
+          intent.symbol,
+          routed.averagePrice,
+          intent.side,
+          routed.filledQty,
+        )
+        if (!result.ok) {
+          failed = true
+          logEvent({
+            kind: 'order',
+            subject: intent.symbol,
+            detail: `The venue confirmed a fill, but it could not be booked locally: ${result.error}`,
+          })
+          continue
+        }
         pf = result.portfolio
         booked.push({
-          id: `bot-${Date.now()}-${intent.symbol}-${intent.side}`,
+          id: routed.orderId
+            ? `broker-${routed.orderId}`
+            : `bot-${Date.now()}-${intent.symbol}-${intent.side}`,
           ts: Date.now(),
           symbol: intent.symbol,
           side: intent.side,
-          qty: intent.qty,
-          price: intent.price,
+          qty: routed.filledQty,
+          price: routed.averagePrice,
           source: 'bot',
-          reason: `${intent.reason} · filled by ${conn.label}`,
+          reason: `${intent.reason} · confirmed fill by ${conn.label}`,
           pnl: result.pnl,
           strategy: intent.strategy,
           indicators: intent.indicators,
@@ -509,11 +572,12 @@ export default function App() {
         syncExits(pf, booked)
       }
       if (lastMessage) {
+        const message = lastMessage
         const next = brokersRef.current.map((b) =>
           b.id === conn.id
             ? {
                 ...b,
-                message: lastMessage as string,
+                message,
                 checkedAt: Date.now(),
                 status: failed ? ('error' as const) : b.status,
               }
@@ -525,7 +589,99 @@ export default function App() {
     } finally {
       routingRef.current = false
     }
-  }, [syncExits, withMatches])
+  }, [logEvent, syncExits, withMatches])
+
+  const dispatchAttachedExit = useCallback(
+    async (symbol: string, ins: Instrument, qty: number, reason: string) => {
+      if (routingRef.current || pendingBrokerExitsRef.current.has(symbol)) return
+      const brokerId = routesRef.current[ins.cls] ?? activeBrokerRef.current
+      const conn = brokersRef.current.find((broker) => broker.id === brokerId)
+      if (!conn || conn.kind === 'paper' || !venueSymbol(conn.kind, symbol)) {
+        logEvent({
+          kind: 'order',
+          subject: symbol,
+          detail: 'Stop/target was hit, but no linked venue supports closing this instrument.',
+        })
+        return
+      }
+
+      pendingBrokerExitsRef.current.add(symbol)
+      routingRef.current = true
+      let keepPending = false
+      try {
+        const routed = await submitBrokerOrder(conn, {
+          symbol,
+          side: 'sell',
+          qty,
+          price: ins.price,
+        })
+        if (!routed.ok) {
+          keepPending = routed.status !== 'rejected'
+          logEvent({ kind: 'order', subject: symbol, detail: routed.message })
+          return
+        }
+        if (routed.status === 'accepted' || !routed.filledQty || !routed.averagePrice) {
+          keepPending = true
+          logEvent({
+            kind: 'order',
+            subject: symbol,
+            detail: `${routed.message} The local position remains open until the venue fill is confirmed; reconcile before retrying.`,
+          })
+          return
+        }
+
+        const result = applyOrder(
+          portfolioRef.current,
+          symbol,
+          routed.averagePrice,
+          'sell',
+          routed.filledQty,
+        )
+        if (!result.ok) {
+          keepPending = true
+          logEvent({
+            kind: 'order',
+            subject: symbol,
+            detail: `The venue confirmed an exit fill, but it could not be booked locally: ${result.error}. Reconcile before retrying.`,
+          })
+          return
+        }
+        const fill: Fill = {
+          id: routed.orderId ? `broker-${routed.orderId}` : `exit-${Date.now()}-${symbol}`,
+          ts: Date.now(),
+          symbol,
+          side: 'sell',
+          qty: routed.filledQty,
+          price: routed.averagePrice,
+          source: 'manual',
+          reason: `${reason} · confirmed fill by ${conn.label}`,
+          pnl: result.pnl,
+        }
+        portfolioRef.current = result.portfolio
+        setPortfolio(result.portfolio)
+        setFills((prev) => [...withMatches([fill]), ...prev].slice(0, 160))
+        syncExits(result.portfolio, [fill])
+        if (routed.status === 'partial') {
+          logEvent({
+            kind: 'order',
+            subject: symbol,
+            detail: `${routed.message} The remaining position stays open with its exit attached.`,
+          })
+        }
+      } catch (error) {
+        keepPending = true
+        logEvent({
+          kind: 'order',
+          subject: symbol,
+          detail: `Could not confirm the broker exit: ${error instanceof Error ? error.message : String(error)}. Check the venue before retrying.`,
+        })
+      } finally {
+        if (!keepPending) pendingBrokerExitsRef.current.delete(symbol)
+        routingRef.current = false
+      }
+    },
+    [logEvent, syncExits, withMatches],
+  )
 
   /**
    * One scan of the desk: advance the tape, roll the day, run the bot, fill
@@ -548,24 +704,69 @@ export default function App() {
 
     const blocks = riskBlocksRef.current
     const scannedAt = Date.now()
+    const reservedClassExposure = new Map<AssetClass, number>()
+    let reservedExposure = 0
+    let reservedPositions = 0
+    let reservedTradesToday = 0
     /** Asked before every entry; exits are never blocked. */
-    const entryBlock = (ins: Instrument): string | null => {
-      const top = blocks[0]
-      if (top) {
-        logEvent({ kind: 'block', subject: ins.symbol, detail: top.reason })
-        return top.reason
+    const entryBlock = (ins: Instrument, proposedNotional: number): string | null => {
+      const holdings = Object.entries(portfolioRef.current.holdings).filter(
+        ([, holding]) => holding.qty > 0,
+      )
+      const currentClassExposure = holdings.reduce(
+        (sum, [symbol, holding]) => {
+          const heldInstrument = engine.get(symbol)
+          return heldInstrument?.cls === ins.cls
+            ? sum + holding.qty * heldInstrument.price
+            : sum
+        },
+        0,
+      )
+      const currentExposure = holdings.reduce((sum, [symbol, holding]) => {
+        const heldInstrument = engine.get(symbol)
+        return heldInstrument ? sum + holding.qty * heldInstrument.price : sum
+      }, 0)
+      const reserved = reservedClassExposure.get(ins.cls) ?? 0
+      const approvalReservations = [...approvalReservationsRef.current.values()]
+      const approvalReservedClass = approvalReservations
+        .filter((entry) => entry.assetClass === ins.cls)
+        .reduce((sum, entry) => sum + entry.notional, 0)
+      const approvalReservedExposure = approvalReservations.reduce(
+        (sum, entry) => sum + entry.notional,
+        0,
+      )
+      const opensPosition = !portfolioRef.current.holdings[ins.symbol]
+      const venue = botRef.current.routeToBroker
+        ? brokersRef.current.find((b) => b.id === activeBrokerRef.current)
+        : undefined
+      const gate = checkBotEntry({
+        instrument: ins,
+        proposedNotional,
+        currentClassExposure,
+        reservedClassExposure: reserved + approvalReservedClass,
+        currentExposure,
+        reservedExposure: reservedExposure + approvalReservedExposure,
+        currentPositions: holdings.length,
+        reservedPositions:
+          reservedPositions + approvalReservations.filter((entry) => entry.opensPosition).length,
+        tradesToday: entriesToday(tradeHistory, scannedAt),
+        reservedTradesToday: reservedTradesToday + approvalReservations.length,
+        opensPosition,
+        equity: equityOf(portfolioRef.current),
+        limits: settingsRef.current.limits,
+        riskBlocks: blocks,
+        now: scannedAt,
+        requiresVerifiedHistory: Boolean(venue && venue.kind !== 'paper'),
+        requiresLiveQuote: Boolean(venue && venue.kind !== 'paper'),
+      })
+      if (gate) {
+        logEvent({ kind: gate.kind, subject: ins.symbol, detail: gate.reason })
+        return gate.reason
       }
-      if (marketState(ins.cls) === 'closed') {
-        const why = closedNote(ins.cls)
-        logEvent({ kind: 'session', subject: ins.symbol, detail: why })
-        return why
-      }
-      const maxAge = settingsRef.current.limits.maxQuoteAgeSec * 1000
-      if (quoteStale(ins, scannedAt, maxAge)) {
-        const why = `${ins.symbol} quote is older than ${settingsRef.current.limits.maxQuoteAgeSec}s`
-        logEvent({ kind: 'stale', subject: ins.symbol, detail: why })
-        return why
-      }
+      reservedClassExposure.set(ins.cls, reserved + proposedNotional)
+      reservedExposure += proposedNotional
+      if (opensPosition) reservedPositions += 1
+      reservedTradesToday += 1
       return null
     }
 
@@ -586,21 +787,19 @@ export default function App() {
           entryBlock,
         )
         if (plan.intents.length > 0) enqueueProposals(plan.intents)
-      } else if (venue && venue.kind !== 'paper') {
-        if (!routingRef.current) {
-          const plan = runBotStep(
-            engine.instruments,
-            portfolioRef.current,
-            botRef.current,
-            cooldownsRef.current,
-            tickRef.current,
-            true,
-            exitsRef.current,
-            entryBlock,
-          )
-          if (plan.intents.length > 0) void dispatchBotIntents(plan.intents, venue)
-        }
-      } else {
+      } else if (!routingRef.current && venue && venue.kind !== 'paper') {
+        const plan = runBotStep(
+          engine.instruments,
+          portfolioRef.current,
+          botRef.current,
+          cooldownsRef.current,
+          tickRef.current,
+          true,
+          exitsRef.current,
+          entryBlock,
+        )
+        if (plan.intents.length > 0) void dispatchBotIntents(plan.intents, venue)
+      } else if (!routingRef.current) {
         const result = runBotStep(
           engine.instruments,
           portfolioRef.current,
@@ -621,7 +820,7 @@ export default function App() {
     }
 
     // resting limit orders: fill when the market trades through the price
-    if (ordersRef.current.some((order) => order.status === 'working')) {
+    if (!routingRef.current && ordersRef.current.some((order) => order.status === 'working')) {
       let pf = portfolioRef.current
       const fillsNow: Fill[] = []
       const next: WorkingOrder[] = ordersRef.current.map((order) => {
@@ -658,7 +857,7 @@ export default function App() {
     // attached stops and targets: whatever opened the trade — the bot, a
     // chart plan, a script or the ticket — it closes when either level hits
     const book = exitsRef.current
-    if (Object.keys(book).length > 0) {
+    if (!routingRef.current && Object.keys(book).length > 0) {
       let pf = portfolioRef.current
       const exitFills: Fill[] = []
       let nextBook: ExitBook | null = null
@@ -672,6 +871,18 @@ export default function App() {
         }
         const hit = exitHit(exit, ins.price)
         if (!hit) continue
+        if (pendingBrokerExitsRef.current.has(symbol)) continue
+        const brokerId = routesRef.current[ins.cls] ?? activeBrokerRef.current
+        const exitVenue = brokersRef.current.find((broker) => broker.id === brokerId)
+        if (exitVenue && exitVenue.kind !== 'paper') {
+          void dispatchAttachedExit(
+            symbol,
+            ins,
+            held.qty,
+            hit === 'stop' ? 'Stop loss hit' : 'Take profit hit',
+          )
+          continue
+        }
         const result = applyOrder(pf, symbol, ins.price, 'sell', held.qty)
         if (!result.ok) continue
         pf = result.portfolio
@@ -710,7 +921,16 @@ export default function App() {
       if (lastPoint && Math.abs(lastPoint.v - equityNow) < 0.005) return prev
       return [...prev, { t: sampledAt, v: equityNow }].slice(-1200)
     })
-  }, [engine, equityOf, dispatchBotIntents, enqueueProposals, syncExits, logEvent])
+  }, [
+    engine,
+    equityOf,
+    dispatchBotIntents,
+    dispatchAttachedExit,
+    enqueueProposals,
+    syncExits,
+    logEvent,
+    tradeHistory,
+  ])
 
   const lastScanRef = useRef(Date.now())
 
@@ -757,7 +977,7 @@ export default function App() {
   // The whole desk, written to this browser on every change. The storage
   // module keeps a known-good fallback copy behind it.
   useEffect(() => {
-    saveDesk({
+    const saved = saveDesk({
       portfolio,
       fills,
       history: tradeHistory,
@@ -771,6 +991,7 @@ export default function App() {
       audit: auditLog,
       governor,
     })
+    setStorageWarning(!saved)
   }, [
     portfolio,
     fills,
@@ -907,10 +1128,25 @@ export default function App() {
       limit: number,
       /** The setup behind a bot-approved proposal, kept with the fill. */
       setup?: { strategy: StrategyId; indicators?: IndicatorReading[] },
-    ): Promise<{ ok: true } | { ok: false; error: string }> => {
+    ): Promise<
+      { ok: true; accepted?: boolean; message?: string } | { ok: false; error: string }
+    > => {
       const ins = engine.get(symbol)
       if (!ins) return { ok: false, error: `${symbol} is not a listed instrument.` }
       if (!Number.isFinite(qty) || qty <= 0) return { ok: false, error: 'Enter a quantity above zero.' }
+      if (type === 'market' && routingRef.current) {
+        return { ok: false, error: 'A broker order is still being processed. Try again shortly.' }
+      }
+      const routedExternally = activeBrokerConn.kind !== 'paper'
+      if (type === 'market' && routedExternally) {
+        const maxAge = settingsRef.current.limits.maxQuoteAgeSec * 1000
+        if (!ins.live || quoteStale(ins, Date.now(), maxAge)) {
+          return {
+            ok: false,
+            error: 'A fresh live quote is required before sending an order to this broker.',
+          }
+        }
+      }
 
       if (type === 'limit') {
         if (!Number.isFinite(limit) || limit <= 0) {
@@ -936,67 +1172,106 @@ export default function App() {
       const preview = applyOrder(portfolioRef.current, ins.symbol, ins.price, side, qty)
       if (!preview.ok) return preview
 
-      // A routed order books at the venue's own entry price when the bridge
-      // can report one, so the ledger does not drift from the real fill.
+      let fillQty = qty
       let fillPrice = ins.price
+      let fillId: string | undefined
+      if (routedExternally) routingRef.current = true
+      try {
+        if (routedExternally) {
+          const routed = await submitBrokerOrder(activeBrokerConn, {
+            symbol: ins.symbol,
+            side,
+            qty,
+            price: ins.price,
+          })
+          const nextBrokers = brokersRef.current.map((b) =>
+            b.id === activeBrokerConn.id
+              ? {
+                  ...b,
+                  message: routed.message,
+                  checkedAt: Date.now(),
+                  status: routed.ok ? b.status : ('error' as const),
+                }
+              : b,
+          )
+          brokersRef.current = nextBrokers
+          setBrokers(nextBrokers)
+          if (!routed.ok) {
+            logEvent({ kind: 'order', subject: ins.symbol, detail: routed.message })
+            return { ok: false, error: routed.message }
+          }
+          if (routed.status === 'accepted') {
+            logEvent({ kind: 'order', subject: ins.symbol, detail: routed.message })
+            return { ok: true, accepted: true, message: routed.message }
+          }
+          if (!routed.filledQty || !routed.averagePrice) {
+            const message =
+              'The venue response lacked confirmed fill details. Check the venue before retrying.'
+            logEvent({ kind: 'order', subject: ins.symbol, detail: message })
+            return { ok: false, error: message }
+          }
+          fillQty = routed.filledQty
+          // Use the venue's per-order average fill instead of a position-level
+          // average that may include earlier trades.
+          fillPrice = routed.averagePrice
+          fillId = routed.orderId
+          if (routed.status === 'partial') {
+            logEvent({
+              kind: 'order',
+              subject: ins.symbol,
+              detail: `${routed.message} The remaining quantity is not tracked here; reconcile it at the venue.`,
+            })
+          }
+        }
 
-      if (activeBrokerConn.kind !== 'paper') {
-        const routed = await submitBrokerOrder(activeBrokerConn, {
+        const result = applyOrder(portfolioRef.current, ins.symbol, fillPrice, side, fillQty)
+        if (!result.ok) {
+          const message = routedExternally
+            ? `The venue confirmed a fill, but it could not be booked locally: ${result.error}. Reconcile before retrying.`
+            : result.error
+          if (routedExternally) logEvent({ kind: 'order', subject: ins.symbol, detail: message })
+          return { ok: false, error: message }
+        }
+
+        const fill: Fill = {
+          id: fillId ? `broker-${fillId}` : `${Date.now()}-${ins.symbol}-${side}`,
+          ts: Date.now(),
           symbol: ins.symbol,
           side,
-          qty,
-          price: ins.price,
-        })
-        const nextBrokers = brokersRef.current.map((b) =>
-          b.id === activeBrokerConn.id
-            ? {
-                ...b,
-                message: routed.message,
-                checkedAt: Date.now(),
-                status: routed.ok ? b.status : ('error' as const),
-              }
-            : b,
-        )
-        brokersRef.current = nextBrokers
-        setBrokers(nextBrokers)
-        if (!routed.ok) return { ok: false, error: routed.message }
-        const booked = await venueFillPrice(activeBrokerConn, ins.symbol)
-        if (booked) fillPrice = booked
+          qty: fillQty,
+          price: fillPrice,
+          source: 'manual',
+          reason:
+            activeBrokerConn.kind === 'paper'
+              ? side === 'buy'
+                ? 'Market buy placed by you'
+                : 'Market sell placed by you'
+              : `Confirmed fill by ${activeBrokerConn.label}`,
+          pnl: result.pnl,
+          strategy: setup?.strategy,
+          indicators: setup?.indicators,
+        }
+        if (side === 'sell') pendingBrokerExitsRef.current.delete(ins.symbol)
+        portfolioRef.current = result.portfolio
+        setPortfolio(result.portfolio)
+        setFills((prev) => [...withMatches([fill]), ...prev].slice(0, 160))
+        syncExits(result.portfolio, [fill])
+        return { ok: true }
+      } finally {
+        if (routedExternally) routingRef.current = false
       }
-
-      const result = applyOrder(portfolioRef.current, ins.symbol, fillPrice, side, qty)
-      if (!result.ok) return result
-
-      const fill: Fill = {
-        id: `${Date.now()}-${ins.symbol}-${side}`,
-        ts: Date.now(),
-        symbol: ins.symbol,
-        side,
-        qty,
-        price: fillPrice,
-        source: 'manual',
-        reason:
-          activeBrokerConn.kind === 'paper'
-            ? side === 'buy'
-              ? 'Market buy placed by you'
-              : 'Market sell placed by you'
-            : `Routed to ${activeBrokerConn.label}`,
-        pnl: result.pnl,
-        strategy: setup?.strategy,
-        indicators: setup?.indicators,
-      }
-      portfolioRef.current = result.portfolio
-      setPortfolio(result.portfolio)
-      setFills((prev) => [...withMatches([fill]), ...prev].slice(0, 160))
-      syncExits(result.portfolio, [fill])
-      return { ok: true }
     },
-    [engine, activeBrokerConn, syncExits, withMatches],
+    [engine, activeBrokerConn, logEvent, syncExits, withMatches],
   )
 
   const submitOrder = useCallback(
-    (side: Side, qty: number, type: OrderType, limit: number) =>
-      placeOrder(selected, side, qty, type, limit),
+    (
+      side: Side,
+      qty: number,
+      type: OrderType,
+      limit: number,
+      setup?: { strategy: StrategyId; indicators: IndicatorReading[] },
+    ) => placeOrder(selected, side, qty, type, limit, setup),
     [placeOrder, selected],
   )
 
@@ -1029,36 +1304,109 @@ export default function App() {
   const approveProposal = useCallback(
     async (id: string) => {
       const proposal = proposalsRef.current.find((p) => p.id === id)
-      if (!proposal || proposal.status !== 'pending') return
-      const ins = engine.get(proposal.symbol)
-      if (!ins) {
-        settleProposal(id, 'expired', 'Instrument unavailable')
-        return
+      if (!proposal || proposal.status !== 'pending' || approvingProposalIdsRef.current.has(id)) return
+      approvingProposalIdsRef.current.add(id)
+      try {
+        const ins = engine.get(proposal.symbol)
+        if (!ins) {
+          settleProposal(id, 'expired', 'Instrument unavailable')
+          return
+        }
+        const notional = proposal.qty * ins.price
+        let reservation: { assetClass: AssetClass; notional: number; opensPosition: boolean } | null =
+          null
+        if (proposal.side === 'buy') {
+          const holdings = Object.entries(portfolioRef.current.holdings).filter(
+            ([, holding]) => holding.qty > 0,
+          )
+          const currentClassExposure = holdings.reduce((sum, [symbol, holding]) => {
+            const heldInstrument = engine.get(symbol)
+            return heldInstrument?.cls === ins.cls
+              ? sum + holding.qty * heldInstrument.price
+              : sum
+          }, 0)
+          const currentExposure = holdings.reduce((sum, [symbol, holding]) => {
+            const heldInstrument = engine.get(symbol)
+            return heldInstrument ? sum + holding.qty * heldInstrument.price : sum
+          }, 0)
+          const opensPosition = !portfolioRef.current.holdings[ins.symbol]
+          const activeReservations = [...approvalReservationsRef.current.values()]
+          const reservedClassExposure = activeReservations
+            .filter((entry) => entry.assetClass === ins.cls)
+            .reduce((sum, entry) => sum + entry.notional, 0)
+          const reservedExposure = activeReservations.reduce((sum, entry) => sum + entry.notional, 0)
+          const reservedPositions = activeReservations.filter((entry) => entry.opensPosition).length
+          const reservedTradesToday = activeReservations.length
+          const now = Date.now()
+          const venue = botRef.current.routeToBroker
+            ? brokersRef.current.find((broker) => broker.id === activeBrokerRef.current)
+            : undefined
+          const gate = checkBotEntry({
+            instrument: ins,
+            proposedNotional: notional,
+            currentClassExposure,
+            reservedClassExposure,
+            currentExposure,
+            reservedExposure,
+            currentPositions: holdings.length,
+            reservedPositions,
+            tradesToday: entriesToday(tradeHistory, now),
+            reservedTradesToday,
+            opensPosition,
+            equity: equityOf(portfolioRef.current),
+            limits: settingsRef.current.limits,
+            riskBlocks: riskBlocksRef.current,
+            now,
+            requiresVerifiedHistory: Boolean(venue && venue.kind !== 'paper'),
+            requiresLiveQuote: Boolean(venue && venue.kind !== 'paper'),
+          })
+          if (gate) {
+            logEvent({ kind: gate.kind, subject: ins.symbol, detail: gate.reason })
+            settleProposal(id, 'expired', gate.reason)
+            return
+          }
+          reservation = { assetClass: ins.cls, notional, opensPosition }
+        }
+        const drift = Math.abs(ins.price / proposal.price - 1) * 100
+        if (drift > settingsRef.current.maxDriftPct) {
+          settleProposal(
+            id,
+            'expired',
+            `Price moved ${drift.toFixed(2)}% since the signal — setup retired`,
+          )
+          return
+        }
+        if (reservation) approvalReservationsRef.current.set(id, reservation)
+        let keepReservation = false
+        try {
+          const result = await placeOrder(
+            proposal.symbol,
+            proposal.side,
+            proposal.qty,
+            'market',
+            0,
+            proposal.strategy
+              ? { strategy: proposal.strategy, indicators: proposal.indicators }
+              : undefined,
+          )
+          keepReservation = Boolean(result.ok && result.accepted && reservation)
+          settleProposal(
+            id,
+            result.ok ? (result.accepted ? 'accepted' : 'approved') : 'expired',
+            result.ok
+              ? result.accepted
+                ? (result.message ?? 'Order sent; fill not confirmed. Reconcile at the venue.')
+                : `Filled at ${fmtPrice(ins.price, ins.dp)}`
+              : result.error,
+          )
+        } finally {
+          if (!keepReservation) approvalReservationsRef.current.delete(id)
+        }
+      } finally {
+        approvingProposalIdsRef.current.delete(id)
       }
-      const drift = Math.abs(ins.price / proposal.price - 1) * 100
-      if (drift > settingsRef.current.maxDriftPct) {
-        settleProposal(
-          id,
-          'expired',
-          `Price moved ${drift.toFixed(2)}% since the signal — setup retired`,
-        )
-        return
-      }
-      const result = await placeOrder(
-        proposal.symbol,
-        proposal.side,
-        proposal.qty,
-        'market',
-        0,
-        proposal.strategy ? { strategy: proposal.strategy, indicators: proposal.indicators } : undefined,
-      )
-      settleProposal(
-        id,
-        result.ok ? 'approved' : 'expired',
-        result.ok ? `Filled at ${fmtPrice(ins.price, ins.dp)}` : result.error,
-      )
     },
-    [engine, placeOrder, settleProposal],
+    [engine, placeOrder, settleProposal, equityOf, logEvent, tradeHistory],
   )
 
   /** Applies generated script steps in order and reports what happened. */
@@ -1227,6 +1575,10 @@ export default function App() {
   }
 
   const resetAccount = () => {
+    if (routingRef.current) {
+      window.alert('Wait for the broker order to finish before resetting the account.')
+      return
+    }
     if (!window.confirm('Reset the account to $100,000, clear fills and cancel working orders?')) return
     const fresh = startingPortfolio()
     portfolioRef.current = fresh
@@ -1363,6 +1715,10 @@ export default function App() {
   }
 
   const importState = async (file: File) => {
+    if (file.size > MAX_BACKUP_SIZE) {
+      window.alert('That backup is too large to import (maximum 5 MB).')
+      return
+    }
     let next: StoredState | null = null
     try {
       const parsed = JSON.parse(await file.text()) as { state?: unknown }
@@ -1376,7 +1732,11 @@ export default function App() {
       return
     }
     if (!window.confirm('Replace the current paper account with this backup?')) return
-    applyState(withoutSecrets(next))
+    if (routingRef.current) {
+      window.alert('Wait for the broker order to finish before restoring a backup.')
+      return
+    }
+    applyState(next)
   }
 
   const change = changePct(instrument)
@@ -1395,6 +1755,31 @@ export default function App() {
     ...exitLevels,
   ]
   const chartData = instrument.history.slice(-rangePoints)
+  const ticketRecommendation = useMemo(() => {
+    const marketMatch = matchStrategyToMarket(instrument, bot)
+    return {
+      ...marketMatch,
+      verifiedHistory: Boolean(instrument.historyVerified),
+      indicators: marketMatch.strategy
+        ? [
+            ...indicatorReadings(
+              marketMatch.strategy,
+              instrument.history,
+              {
+                ...defaultParams(marketMatch.strategy),
+                ...(bot.params[marketMatch.strategy] ?? {}),
+              },
+              pipSize(instrument.price, instrument.cls),
+            ),
+            { label: 'Market regime', value: marketMatch.regime },
+            {
+              label: 'History source',
+              value: instrument.historyVerified ? 'Verified bars' : 'Simulated',
+            },
+          ]
+        : [],
+    }
+  }, [instrument, bot, now])
   const high = Math.max(...chartData)
   const low = Math.min(...chartData)
   const rangeChange = ((chartData[chartData.length - 1] - chartData[0]) / chartData[0]) * 100
@@ -1438,6 +1823,12 @@ export default function App() {
         onOpenSettings={() => setView('settings')}
         name={profile.name}
       />
+      {storageWarning && (
+        <p className="error" role="alert">
+          This desk could not be saved or another tab changed it. Export a backup and reload before
+          continuing to avoid overwriting newer data.
+        </p>
+      )}
 
       <div className="terminal">
         <aside className="col col--left">
@@ -1474,13 +1865,18 @@ export default function App() {
                         className={instrument.live ? 'market__feed is-live' : 'market__feed'}
                         title={
                           instrument.live
-                            ? `${instrument.source} · updated ${clockTime(
+                            ? `${instrument.source} quote · updated ${clockTime(
                                 instrument.liveAt ?? now,
-                              )}`
+                              )}; chart history is ${instrument.historyVerified ? 'verified' : 'simulated'}`
                             : 'No free key-less feed for this market — the tape is simulated'
                         }
                       >
                         {instrument.live ? `Live · ${instrument.source}` : 'Simulated'}
+                      </span>
+                      <span
+                        className={`market__history${instrument.historyVerified ? ' is-verified' : ''}`}
+                      >
+                        {instrument.historyVerified ? 'Verified bar history' : 'Simulated chart history'}
                       </span>
                     </div>
                     <h1>{instrument.symbol}</h1>
@@ -1546,7 +1942,9 @@ export default function App() {
                   holding={portfolio.holdings[instrument.symbol]}
                   connections={brokers}
                   activeBrokerId={activeBrokerConn.id}
+                  maxQuoteAgeSec={settings.limits.maxQuoteAgeSec}
                   remembered={routes[instrument.cls] === activeBrokerConn.id}
+                  recommendation={ticketRecommendation}
                   onRoute={routeBroker}
                   onSubmit={submitOrder}
                 />

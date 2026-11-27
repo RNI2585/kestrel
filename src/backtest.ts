@@ -1,5 +1,15 @@
-import { activeRisk, signalFor, tunedParams, withRisk, type BotConfig } from './bot'
-import { pipSize } from './market'
+import {
+  defaultParams,
+  marketCondition,
+  matchStrategyToMarket,
+  riskFor,
+  signalFor,
+  sizeForStopRisk,
+  tunedParams,
+  withRisk,
+  type BotConfig,
+} from './bot'
+import { pipSize, type AssetClass, type Instrument } from './market'
 import { applyOrder, START_CASH, startingPortfolio } from './trade'
 
 export interface BacktestAverages {
@@ -88,16 +98,19 @@ function downsample(points: number[], target = 140): number[] {
 }
 
 /**
- * Replays the bot's rules over a synthetic tape for one instrument: same
- * signals, same stop/target exits, same commission, same risk sizing.
+ * Replays the bot's rules over a synthetic tape, including modelled costs.
  */
 export function runBacktest(opts: {
   symbol: string
+  assetClass?: AssetClass
   vol: number
   startPrice: number
   cfg: BotConfig
   seed: number
   ticks?: number
+  /** Estimated full spread width and one-way slippage, in basis points. */
+  spreadBps?: number
+  slippageBps?: number
 }): BacktestResult {
   const ticks = opts.ticks ?? TICKS
   const series = syntheticSeries(opts.vol, opts.startPrice, ticks, opts.seed)
@@ -112,7 +125,9 @@ export function runBacktest(opts: {
   let grossLoss = 0
   const rMultiples: number[] = []
   const tuning = tunedParams(opts.cfg)
-  const risk = activeRisk(opts.cfg)
+  let openStopPct = 0
+  let openTargetPct = 0
+  const assetClass = opts.assetClass ?? 'Crypto'
 
   const equityAt = (price: number) => {
     const held = portfolio.holdings[opts.symbol]
@@ -126,33 +141,72 @@ export function runBacktest(opts: {
     if (t < WARMUP) continue
     const price = series[t]
     const held = portfolio.holdings[opts.symbol]
-    const signal = signalFor(opts.cfg.strategy, history, tuning, pipSize(price))
+    const simulatedInstrument: Instrument = {
+      symbol: opts.symbol,
+      name: opts.symbol,
+      cls: assetClass,
+      dp: 2,
+      price,
+      prevClose: history[0],
+      history,
+      vol: opts.vol,
+      base: opts.startPrice,
+      historyVerified: false,
+    }
+    const match =
+      opts.cfg.strategyMode === 'market-fit'
+        ? matchStrategyToMarket(simulatedInstrument, opts.cfg)
+        : null
+    const strategy = match?.strategy ?? opts.cfg.strategy
+    const risk = riskFor(opts.cfg, strategy)
+    const activeTuning =
+      opts.cfg.strategyMode === 'market-fit'
+        ? { ...defaultParams(strategy), ...(opts.cfg.params[strategy] ?? {}) }
+        : tuning
+    const signal = signalFor(strategy, history, activeTuning, pipSize(price, assetClass))
     let side: 'buy' | 'sell' | null = null
     let qty = 0
 
     if (held && held.qty > 1e-8) {
       const gain = (price / held.avgCost - 1) * 100
-      if (gain <= -risk.stopLossPct || gain >= risk.takeProfitPct || signal.dir < 0) {
+      if (gain <= -openStopPct || gain >= openTargetPct || signal.dir < 0) {
         side = 'sell'
         qty = held.qty
         // R multiple: how far the trade travelled in units of the stop risked.
-        rMultiples.push(gain / (risk.stopLossPct || 1))
+        rMultiples.push(gain / (openStopPct || 1))
       }
-    } else if (signal.dir > 0) {
+    } else if (
+      signal.dir > 0 &&
+      (opts.cfg.strategyMode !== 'market-fit' || (match?.strategy && match.dir === 1))
+    ) {
       const equity = equityAt(price)
-      const budget = Math.min(equity * (risk.riskPct / 100), portfolio.cash)
+      const budget = sizeForStopRisk(
+        equity,
+        risk.riskPct,
+        risk.stopLossPct,
+        equity * (opts.cfg.maxAllocPct / 100),
+        portfolio.cash,
+        marketCondition(history).volatilityPct,
+      )
       if (budget > equity * 0.005) {
         side = 'buy'
         qty = budget / price
+        openStopPct = risk.stopLossPct
+        openTargetPct = risk.takeProfitPct
       }
     }
 
     if (side) {
-      const result = applyOrder(portfolio, opts.symbol, price, side, qty)
+      const spread = (opts.spreadBps ?? 5) / 20_000
+      const slippage = (opts.slippageBps ?? 5) / 10_000
+      const executionPrice = price * (1 + (side === 'buy' ? 1 : -1) * (spread + slippage))
+      const result = applyOrder(portfolio, opts.symbol, executionPrice, side, qty)
       if (result.ok) {
         portfolio = result.portfolio
         trades += 1
         if (side === 'sell') {
+          openStopPct = 0
+          openTargetPct = 0
           const pnl = result.pnl ?? 0
           if (pnl > 0) {
             wins += 1
@@ -257,6 +311,7 @@ export function averageBacktests(runs: BacktestResult[]): BacktestAverages {
 /** One cell of the sweep: fixed stop, target and risk, averaged over several tapes. */
 export function sweepCombo(opts: {
   symbol: string
+  assetClass?: AssetClass
   vol: number
   startPrice: number
   baseCfg: BotConfig
@@ -265,6 +320,8 @@ export function sweepCombo(opts: {
   takeProfitPct: number
   riskPct: number
   ticks?: number
+  spreadBps?: number
+  slippageBps?: number
 }): SweepRow {
   const cfg: BotConfig = withRisk({ ...opts.baseCfg }, {
     riskPct: opts.riskPct,
@@ -274,11 +331,14 @@ export function sweepCombo(opts: {
   const runs = opts.seeds.map((seed) =>
     runBacktest({
       symbol: opts.symbol,
+      assetClass: opts.assetClass,
       vol: opts.vol,
       startPrice: opts.startPrice,
       cfg,
       seed,
       ticks: opts.ticks,
+      spreadBps: opts.spreadBps,
+      slippageBps: opts.slippageBps,
     }),
   )
   const avg = averageBacktests(runs)
@@ -318,6 +378,7 @@ export interface WalkForwardResult {
  */
 export function walkForward(opts: {
   symbol: string
+  assetClass?: AssetClass
   vol: number
   startPrice: number
   baseCfg: BotConfig
@@ -327,6 +388,8 @@ export function walkForward(opts: {
   trainSeeds: number[]
   testSeeds: number[]
   ticks?: number
+  spreadBps?: number
+  slippageBps?: number
 }): WalkForwardResult {
   let best: SweepRow | null = null
   for (const stopPct of opts.stopPcts) {
@@ -334,6 +397,7 @@ export function walkForward(opts: {
       for (const riskPct of opts.riskPcts) {
         const row = sweepCombo({
           symbol: opts.symbol,
+          assetClass: opts.assetClass,
           vol: opts.vol,
           startPrice: opts.startPrice,
           baseCfg: opts.baseCfg,
@@ -342,6 +406,8 @@ export function walkForward(opts: {
           takeProfitPct,
           riskPct,
           ticks: opts.ticks,
+          spreadBps: opts.spreadBps,
+          slippageBps: opts.slippageBps,
         })
         // The highest average return wins; ties go to the tighter stop, since
         // the fit should not be decided by luck between equal results.
@@ -361,6 +427,7 @@ export function walkForward(opts: {
     opts.trainSeeds.map((seed) =>
       runBacktest({
         symbol: opts.symbol,
+        assetClass: opts.assetClass,
         vol: opts.vol,
         startPrice: opts.startPrice,
         cfg: withRisk({ ...opts.baseCfg }, {
@@ -370,6 +437,8 @@ export function walkForward(opts: {
         }),
         seed,
         ticks: opts.ticks,
+        spreadBps: opts.spreadBps,
+        slippageBps: opts.slippageBps,
       }),
     ),
   )
@@ -377,6 +446,7 @@ export function walkForward(opts: {
     opts.testSeeds.map((seed) =>
       runBacktest({
         symbol: opts.symbol,
+        assetClass: opts.assetClass,
         vol: opts.vol,
         startPrice: opts.startPrice,
         cfg: withRisk({ ...opts.baseCfg }, {
@@ -386,6 +456,8 @@ export function walkForward(opts: {
         }),
         seed,
         ticks: opts.ticks,
+        spreadBps: opts.spreadBps,
+        slippageBps: opts.slippageBps,
       }),
     ),
   )

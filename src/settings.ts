@@ -57,8 +57,8 @@ export function loadSettings(): Settings {
         ? source.requireApproval
         : DEFAULT_SETTINGS.requireApproval,
     maxDriftPct:
-      typeof source.maxDriftPct === 'number' && source.maxDriftPct > 0
-        ? source.maxDriftPct
+      typeof source.maxDriftPct === 'number' && Number.isFinite(source.maxDriftPct)
+        ? Math.min(2, Math.max(0.1, source.maxDriftPct))
         : DEFAULT_SETTINGS.maxDriftPct,
     limits: clampLimits(source.limits),
     streamUrl:
@@ -83,7 +83,8 @@ export function loadProfile(): Profile | null {
   return {
     name: name.slice(0, 40),
     email: typeof source.email === 'string' ? source.email.slice(0, 80) : '',
-    since: typeof source.since === 'number' ? source.since : Date.now(),
+    since:
+      typeof source.since === 'number' && Number.isFinite(source.since) ? source.since : Date.now(),
   }
 }
 
@@ -113,7 +114,7 @@ export interface Proposal {
   /** Price when the signal fired, kept to detect a faded setup. */
   price: number
   reason: string
-  status: 'pending' | 'approved' | 'skipped' | 'expired'
+  status: 'pending' | 'accepted' | 'approved' | 'skipped' | 'expired'
   note?: string
   /** The strategy and its indicator readings when the signal fired. */
   strategy?: StrategyId

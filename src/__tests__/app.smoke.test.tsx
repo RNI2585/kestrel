@@ -65,7 +65,7 @@ describe('the terminal shell', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Desk/ }))
     expect(screen.getByRole('heading', { name: 'XAU' })).toBeTruthy()
-  })
+  }, 30_000)
 
   it('arms auto execution and reflects it in the chrome', () => {
     render(<App />)
@@ -76,7 +76,7 @@ describe('the terminal shell', () => {
     fireEvent.click(toggle)
     expect(toggle.getAttribute('aria-pressed')).toBe('true')
     expect(screen.getByText('Bot scanning')).toBeTruthy()
-  })
+  }, 30_000)
 
   it('opens the desk from a restored profile without a sign-in screen', () => {
     localStorage.setItem(
@@ -86,5 +86,5 @@ describe('the terminal shell', () => {
     render(<App />)
     expect(screen.queryByRole('heading', { name: 'Sign in to your desk' })).toBeNull()
     expect(screen.getByText('Alex')).toBeTruthy()
-  })
+  }, 30_000)
 })

@@ -28,6 +28,7 @@ export default function BacktestPanel({ instrument, bot }: Props) {
       setResult(
         runBacktest({
           symbol: instrument.symbol,
+          assetClass: instrument.cls,
           vol: instrument.vol,
           startPrice: instrument.base,
           cfg: bot,
@@ -45,15 +46,18 @@ export default function BacktestPanel({ instrument, bot }: Props) {
       setWalk(
         walkForward({
           symbol: instrument.symbol,
+          assetClass: instrument.cls,
           vol: instrument.vol,
           startPrice: instrument.base,
           baseCfg: bot,
           stopPcts: [1.5, 2.5, 4],
           takeProfitPcts: [4, 6, 8],
-          riskPcts: [2, 4],
+          riskPcts: [0.5, 1, 1.5],
           trainSeeds: [11, 12, 13],
           testSeeds: [91, 92, 93],
           ticks: 400,
+          spreadBps: 5,
+          slippageBps: 5,
         }),
       )
       setRunning(null)
@@ -74,8 +78,9 @@ export default function BacktestPanel({ instrument, bot }: Props) {
       <div className="backtest__run">
         <div>
           <p className="backtest__blurb">
-            {strategy?.name} over a synthetic tape built from {instrument.symbol}’s volatility, using your
-            current strategy, risk, stop and target settings.
+            {strategy?.name} over a synthetic tape using your current strategy settings. Fills
+            include the ledger commission plus an estimated 5 bps full spread and 5 bps slippage
+            each way.
           </p>
         </div>
         <button className="submit backtest__btn" onClick={run} disabled={running !== null}>
@@ -124,8 +129,8 @@ export default function BacktestPanel({ instrument, bot }: Props) {
             </div>
           </dl>
           <p className="ticket__hint">
-            Exits are chosen on three synthetic tapes, then scored on three the fit never saw. A
-            large negative decay means the settings were fitted to noise.
+            Exits are chosen on three synthetic tapes, then scored on three the fit never saw.
+            Modelled trading costs are included; this is not historical-market validation.
           </p>
         </div>
       )}
@@ -178,8 +183,8 @@ export default function BacktestPanel({ instrument, bot }: Props) {
           <BacktestCurve result={result} positive={positive} />
 
           <p className="ticket__hint">
-            Ended {money(result.startEquity)} → {money(result.endEquity)}. Different synthetic path each run, so
-            re-run to see how sensitive the edge is.
+            Ended {money(result.startEquity)} → {money(result.endEquity)}. Synthetic paths are
+            educational only; they cannot establish a real-market edge.
           </p>
         </>
       )}

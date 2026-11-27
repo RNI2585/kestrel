@@ -103,9 +103,15 @@ async function fxQuotes(at: number, failed: string[]): Promise<Record<string, Qu
     const raw = (await getJson('https://open.er-api.com/v6/latest/USD')) as {
       result?: string
       rates?: Record<string, number>
+      time_last_update_unix?: number
     }
     const rates = raw.rates
     if (raw.result !== 'success' || !rates) throw new Error('no rates')
+    const updatedAt =
+      typeof raw.time_last_update_unix === 'number' ? raw.time_last_update_unix * 1000 : NaN
+    if (!Number.isFinite(updatedAt) || updatedAt <= 0 || updatedAt > at + 30_000) {
+      throw new Error('invalid FX update timestamp')
+    }
     const usdPer = (code: string) => {
       const perUsd = num(rates[code])
       return perUsd === null ? null : 1 / perUsd
@@ -115,7 +121,7 @@ async function fxQuotes(at: number, failed: string[]): Promise<Record<string, Qu
       const baseUsd = pair.base === 'USD' ? 1 : usdPer(pair.base)
       const quoteUsd = pair.quote === 'USD' ? 1 : usdPer(pair.quote)
       if (baseUsd === null || quoteUsd === null) continue
-      out[pair.symbol] = { price: baseUsd / quoteUsd, source: 'open.er-api', at }
+      out[pair.symbol] = { price: baseUsd / quoteUsd, source: 'open.er-api', at: updatedAt }
     }
     return out
   } catch {

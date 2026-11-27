@@ -1,5 +1,7 @@
 import type { StrategyId } from './bot'
+import type { Instrument } from './market'
 import type { StrategyRecord } from './match'
+import { closedNote, marketState, quoteStale } from './session'
 import type { Fill } from './trade'
 
 /**
@@ -14,6 +16,8 @@ export interface RiskLimits {
   maxDailyLossPct: number
   /** Gross position value as a share of equity. */
   maxExposurePct: number
+  /** Position value in one asset class as a share of equity. */
+  maxClassExposurePct: number
   /** Open positions at once. */
   maxPositions: number
   /** Entries per session. */
@@ -31,6 +35,7 @@ export interface RiskLimits {
 export const DEFAULT_RISK_LIMITS: RiskLimits = {
   maxDailyLossPct: 3,
   maxExposurePct: 80,
+  maxClassExposurePct: 40,
   maxPositions: 6,
   maxTradesPerDay: 30,
   maxConsecutiveLosses: 4,
@@ -53,9 +58,151 @@ export interface RiskBlock {
   reason: string
 }
 
+export interface BotEntryCheckInput {
+  instrument: Instrument
+  proposedNotional: number
+  currentClassExposure: number
+  reservedClassExposure?: number
+  currentExposure: number
+  reservedExposure?: number
+  currentPositions: number
+  reservedPositions?: number
+  tradesToday: number
+  reservedTradesToday?: number
+  opensPosition: boolean
+  equity: number
+  limits: RiskLimits
+  riskBlocks: RiskBlock[]
+  now: number
+  requiresVerifiedHistory: boolean
+  requiresLiveQuote: boolean
+}
+
+export interface BotEntryBlock {
+  kind: 'block' | 'session' | 'stale'
+  reason: string
+}
+
+/** Revalidates a proposed bot entry at both scan time and user approval time. */
+export function checkBotEntry(input: BotEntryCheckInput): BotEntryBlock | null {
+  const {
+    instrument,
+    proposedNotional,
+    currentClassExposure,
+    reservedClassExposure = 0,
+    currentExposure,
+    reservedExposure = 0,
+    currentPositions,
+    reservedPositions = 0,
+    tradesToday,
+    reservedTradesToday = 0,
+    opensPosition,
+    equity,
+    limits,
+    riskBlocks,
+    now,
+  } = input
+
+  if (
+    ![
+      proposedNotional,
+      currentClassExposure,
+      reservedClassExposure,
+      currentExposure,
+      reservedExposure,
+      currentPositions,
+      reservedPositions,
+      tradesToday,
+      reservedTradesToday,
+      equity,
+      limits.maxExposurePct,
+      limits.maxClassExposurePct,
+      limits.maxPositions,
+      limits.maxTradesPerDay,
+      limits.maxQuoteAgeSec,
+      now,
+    ].every(Number.isFinite) ||
+    proposedNotional <= 0 ||
+    currentClassExposure < 0 ||
+    reservedClassExposure < 0 ||
+    currentExposure < 0 ||
+    reservedExposure < 0 ||
+    currentPositions < 0 ||
+    reservedPositions < 0 ||
+    tradesToday < 0 ||
+    reservedTradesToday < 0 ||
+    equity <= 0 ||
+    limits.maxExposurePct <= 0 ||
+    limits.maxPositions <= 0 ||
+    limits.maxTradesPerDay <= 0
+  ) {
+    return { kind: 'block', reason: 'Bot entry sizing or account exposure is invalid' }
+  }
+
+  if (riskBlocks[0]) return { kind: 'block', reason: riskBlocks[0].reason }
+
+  const classExposureCap = equity * (limits.maxClassExposurePct / 100)
+  if (currentClassExposure + reservedClassExposure + proposedNotional > classExposureCap + 1e-8) {
+    return {
+      kind: 'block',
+      reason: `${instrument.cls} exposure would exceed the ${limits.maxClassExposurePct}% asset-class cap`,
+    }
+  }
+
+  const exposureCap = equity * (limits.maxExposurePct / 100)
+  if (currentExposure + reservedExposure + proposedNotional > exposureCap + 1e-8) {
+    return {
+      kind: 'block',
+      reason: `Exposure would exceed the ${limits.maxExposurePct}% account cap`,
+    }
+  }
+
+  if (opensPosition && currentPositions + reservedPositions >= limits.maxPositions) {
+    return {
+      kind: 'block',
+      reason: `${currentPositions + reservedPositions} of ${limits.maxPositions} position slots are full`,
+    }
+  }
+
+  if (tradesToday + reservedTradesToday >= limits.maxTradesPerDay) {
+    return {
+      kind: 'block',
+      reason: `${tradesToday + reservedTradesToday} entries taken today, the cap is ${limits.maxTradesPerDay}`,
+    }
+  }
+
+  if (marketState(instrument.cls, new Date(now)) === 'closed') {
+    return { kind: 'session', reason: closedNote(instrument.cls) }
+  }
+
+  if (input.requiresVerifiedHistory && !instrument.historyVerified) {
+    return {
+      kind: 'stale',
+      reason: `${instrument.symbol} has no verified historical bars; broker-routed bot signals are paused`,
+    }
+  }
+
+  if (input.requiresLiveQuote && !instrument.live) {
+    return {
+      kind: 'stale',
+      reason: `${instrument.symbol} has no live quote; external orders require a live feed`,
+    }
+  }
+
+  if (quoteStale(instrument, now, limits.maxQuoteAgeSec * 1000)) {
+    return {
+      kind: 'stale',
+      reason: `${instrument.symbol} quote is older than ${limits.maxQuoteAgeSec}s`,
+    }
+  }
+
+  return null
+}
+
 const LIMIT_FIELDS: { key: keyof RiskLimits; min: number; max: number }[] = [
   { key: 'maxDailyLossPct', min: 0.1, max: 100 },
   { key: 'maxExposurePct', min: 1, max: 1000 },
+  { key: 'maxClassExposurePct', min: 1, max: 1000 },
   { key: 'maxPositions', min: 1, max: 100 },
   { key: 'maxTradesPerDay', min: 1, max: 2000 },
   { key: 'maxConsecutiveLosses', min: 1, max: 100 },

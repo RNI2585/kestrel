@@ -11,6 +11,8 @@ export type StrategyId =
   | 'dip'
   | 'scalp'
   | 'pips'
+  | 'support'
+  | 'ict'
 
 /** The money settings that travel with a strategy. */
 export interface RiskSettings {
@@ -35,6 +37,10 @@ export type StrategyParams = Partial<Record<StrategyId, Record<string, number>>>
 export interface BotConfig {
   running: boolean
   strategy: StrategyId
+  /** Keep one armed model, or select a suitable model independently per market. */
+  strategyMode: 'fixed' | 'market-fit'
+  /** Prevents older allocation-sized risk settings from being reinterpreted. */
+  riskSizingVersion: 1
   maxAllocPct: number
   /** Risk, stop and target per strategy, so switching strategies swaps the exits too. */
   riskPrefs: Partial<Record<StrategyId, RiskSettings>>
@@ -48,6 +54,8 @@ export interface BotConfig {
 export const DEFAULT_BOT: BotConfig = {
   running: false,
   strategy: 'momentum',
+  strategyMode: 'fixed',
+  riskSizingVersion: 1,
   riskPrefs: {},
   maxAllocPct: 60,
   classes: ['Stocks', 'Metals', 'Crypto', 'Fx', 'Energy'],
@@ -61,14 +69,16 @@ export const DEFAULT_BOT: BotConfig = {
  * with the terminal.
  */
 export const DEFAULT_RISK: Record<StrategyId, RiskSettings> = {
-  momentum: { riskPct: 4, stopLossPct: 2.5, takeProfitPct: 6 },
-  meanrev: { riskPct: 3, stopLossPct: 2, takeProfitPct: 4 },
-  breakout: { riskPct: 4, stopLossPct: 2.5, takeProfitPct: 8 },
-  rsi: { riskPct: 3, stopLossPct: 2, takeProfitPct: 5 },
-  macd: { riskPct: 4, stopLossPct: 2.5, takeProfitPct: 6 },
-  dip: { riskPct: 3, stopLossPct: 3, takeProfitPct: 5 },
-  scalp: { riskPct: 2, stopLossPct: 1, takeProfitPct: 2 },
-  pips: { riskPct: 3, stopLossPct: 1.2, takeProfitPct: 3 },
+  momentum: { riskPct: 1, stopLossPct: 2.5, takeProfitPct: 6 },
+  meanrev: { riskPct: 1, stopLossPct: 2, takeProfitPct: 4 },
+  breakout: { riskPct: 1, stopLossPct: 2.5, takeProfitPct: 8 },
+  rsi: { riskPct: 1, stopLossPct: 2, takeProfitPct: 5 },
+  macd: { riskPct: 1, stopLossPct: 2.5, takeProfitPct: 6 },
+  dip: { riskPct: 1, stopLossPct: 3, takeProfitPct: 5 },
+  scalp: { riskPct: 0.5, stopLossPct: 1, takeProfitPct: 2 },
+  pips: { riskPct: 1, stopLossPct: 1.2, takeProfitPct: 3 },
+  support: { riskPct: 0.75, stopLossPct: 2, takeProfitPct: 4 },
+  ict: { riskPct: 0.5, stopLossPct: 2.5, takeProfitPct: 5 },
 }
 
 export const PARAM_DEFS: Record<StrategyId, ParamDef[]> = {
@@ -110,6 +120,14 @@ export const PARAM_DEFS: Record<StrategyId, ParamDef[]> = {
     { key: 'trigger', label: 'Breakout by', min: 2, max: 30, step: 1, value: 8, unit: ' pips' },
     { key: 'fade', label: 'Cut when faded', min: 2, max: 20, step: 1, value: 6, unit: ' pips' },
   ],
+  support: [
+    { key: 'look', label: 'Pivot lookback', min: 20, max: 160, step: 4, value: 80, unit: ' ticks' },
+    { key: 'tolerance', label: 'Level proximity', min: 0.1, max: 1.5, step: 0.05, value: 0.5, unit: '%' },
+  ],
+  ict: [
+    { key: 'look', label: 'Structure lookback', min: 20, max: 160, step: 4, value: 80, unit: ' ticks' },
+    { key: 'pivot', label: 'Pivot confirmation', min: 1, max: 5, step: 1, value: 2, unit: ' ticks' },
+  ],
 }
 
 /** The knobs the chosen strategy exposes, for the panel and the backtest label. */
@@ -148,7 +166,11 @@ export function patchRisk(cfg: BotConfig, patch: Partial<RiskSettings>): BotConf
 
 /** Exits for a replay that should not use the strategy's saved settings. */
 export function withRisk(cfg: BotConfig, settings: RiskSettings): BotConfig {
-  return { ...cfg, riskPrefs: { ...cfg.riskPrefs, [cfg.strategy]: { ...settings } } }
+  const riskPrefs =
+    cfg.strategyMode === 'market-fit'
+      ? Object.fromEntries(STRATEGIES.map(({ id }) => [id, { ...settings }]))
+      : { ...cfg.riskPrefs, [cfg.strategy]: { ...settings } }
+  return { ...cfg, riskPrefs: { ...cfg.riskPrefs, ...riskPrefs } }
 }
 
 export const STRATEGIES: { id: StrategyId; name: string; blurb: string }[] = [
@@ -194,6 +216,18 @@ export const STRATEGIES: { id: StrategyId; name: string; blurb: string }[] = [
     blurb:
       'FX and crypto only: buys a fresh high by a set number of pips and leaves once price fades the same way off that high.',
   },
+  {
+    id: 'support',
+    name: 'Support / resistance',
+    blurb:
+      'Uses confirmed close pivots as levels and looks for a small close-based reversal near support or resistance.',
+  },
+  {
+    id: 'ict',
+    name: 'ICT structure (close proxy)',
+    blurb:
+      'Reads breaks of confirmed swing closes and failed-break sweep proxies; wick-based ICT concepts need OHLC candles.',
+  },
 ]
 
 /**
@@ -229,6 +263,143 @@ function sma(history: number[], n: number): number | null {
 export interface Signal {
   dir: -1 | 0 | 1
   note: string
+}
+
+export type MarketRegime =
+  | 'Uptrend'
+  | 'Downtrend'
+  | 'Ranging'
+  | 'High volatility'
+  | 'Warming up'
+
+export interface MarketCondition {
+  regime: MarketRegime
+  volatilityPct: number
+}
+
+export interface StrategyMatch extends MarketCondition {
+  strategy: StrategyId | null
+  dir: -1 | 0 | 1
+  reason: string
+}
+
+interface SwingPoint {
+  index: number
+  price: number
+}
+
+interface SwingLevels {
+  highs: SwingPoint[]
+  lows: SwingPoint[]
+}
+
+function confirmedSwings(history: number[], lookback: number, radius: number): SwingLevels {
+  const highs: SwingPoint[] = []
+  const lows: SwingPoint[] = []
+  const start = Math.max(radius, history.length - lookback - radius)
+  const end = history.length - radius
+
+  for (let index = start; index < end; index++) {
+    const value = history[index]
+    let isHigh = true
+    let isLow = true
+    for (let offset = 1; offset <= radius; offset++) {
+      if (value <= history[index - offset] || value < history[index + offset]) isHigh = false
+      if (value >= history[index - offset] || value > history[index + offset]) isLow = false
+    }
+    if (isHigh) highs.push({ index, price: value })
+    if (isLow) lows.push({ index, price: value })
+  }
+  return { highs, lows }
+}
+
+function latestSwing(points: SwingPoint[]): SwingPoint | null {
+  return points.length > 0 ? points[points.length - 1] : null
+}
+
+function supportResistanceLevels(
+  history: number[],
+  lookback: number,
+  radius = 2,
+): { support: number | null; resistance: number | null } {
+  const last = history[history.length - 1]
+  if (history.length < radius * 2 + 5 || !Number.isFinite(last)) {
+    return { support: null, resistance: null }
+  }
+  const swings = confirmedSwings(history, lookback, radius)
+  const supports = swings.lows.filter((point) => point.price <= last)
+  const resistances = swings.highs.filter((point) => point.price >= last)
+  return {
+    support:
+      supports.length > 0 ? Math.max(...supports.map((point) => point.price)) : null,
+    resistance:
+      resistances.length > 0 ? Math.min(...resistances.map((point) => point.price)) : null,
+  }
+}
+
+interface IctCloseStructure {
+  swingHigh: number
+  swingLow: number
+  dir: -1 | 0 | 1
+  event: string
+}
+
+function ictCloseStructure(
+  history: number[],
+  lookback: number,
+  radius: number,
+): IctCloseStructure | null {
+  if (
+    history.length < radius * 2 + 5 ||
+    history.some((value) => !Number.isFinite(value) || value <= 0)
+  ) {
+    return null
+  }
+  const swings = confirmedSwings(history, lookback, radius)
+  const high = latestSwing(swings.highs)
+  const low = latestSwing(swings.lows)
+  if (!high || !low || history.length < 2) return null
+
+  const previous = history[history.length - 2]
+  const last = history[history.length - 1]
+  if (previous < low.price && last >= low.price) {
+    return {
+      swingHigh: high.price,
+      swingLow: low.price,
+      dir: 1,
+      event: 'Bullish failed-break sweep proxy',
+    }
+  }
+  if (previous > high.price && last <= high.price) {
+    return {
+      swingHigh: high.price,
+      swingLow: low.price,
+      dir: -1,
+      event: 'Bearish failed-break sweep proxy',
+    }
+  }
+  if (previous <= high.price && last > high.price) {
+    return {
+      swingHigh: high.price,
+      swingLow: low.price,
+      dir: 1,
+      event: 'Bullish structure break',
+    }
+  }
+  if (previous >= low.price && last < low.price) {
+    return {
+      swingHigh: high.price,
+      swingLow: low.price,
+      dir: -1,
+      event: 'Bearish structure break',
+    }
+  }
+  return {
+    swingHigh: high.price,
+    swingLow: low.price,
+    dir: 0,
+    event: 'No new close-based structure event',
+  }
 }
 
 function rsi(history: number[], n: number): number | null {
@@ -409,6 +580,46 @@ export function signalFor(
     return { dir: 0, note: `${((last - low) / step).toFixed(1)} pips inside the ${look}-tick range` }
   }
 
+  if (strategy === 'support') {
+    const look = Math.max(12, Math.round(p.look))
+    if (history.length < 12 || !Number.isFinite(history[history.length - 2])) {
+      return { dir: 0, note: 'Warming up' }
+    }
+    const levels = supportResistanceLevels(history, look)
+    if (levels.support === null && levels.resistance === null) {
+      return { dir: 0, note: 'Waiting for confirmed close pivots' }
+    }
+    const previous = history[history.length - 2]
+    const supportDistance =
+      levels.support === null ? Number.POSITIVE_INFINITY : ((last - levels.support) / levels.support) * 100
+    const resistanceDistance =
+      levels.resistance === null
+        ? Number.POSITIVE_INFINITY
+        : ((levels.resistance - last) / levels.resistance) * 100
+    const atSupport = supportDistance >= 0 && supportDistance <= p.tolerance
+    const atResistance = resistanceDistance >= 0 && resistanceDistance <= p.tolerance
+
+    if (atSupport && last > previous && (!atResistance || supportDistance <= resistanceDistance)) {
+      return { dir: 1, note: `Close turned up near support ${levels.support?.toFixed(4)}` }
+    }
+    if (atResistance && last < previous) {
+      return { dir: -1, note: `Close turned down near resistance ${levels.resistance?.toFixed(4)}` }
+    }
+    if (atSupport) return { dir: 0, note: `Near support ${levels.support?.toFixed(4)}; waiting for a close reversal` }
+    if (atResistance) {
+      return { dir: 0, note: `Near resistance ${levels.resistance?.toFixed(4)}; waiting for a close reversal` }
+    }
+    return { dir: 0, note: 'Price is between the nearest confirmed levels' }
+  }
+
+  if (strategy === 'ict') {
+    const look = Math.max(12, Math.round(p.look))
+    const radius = Math.max(1, Math.round(p.pivot))
+    const structure = ictCloseStructure(history, look, radius)
+    if (!structure) return { dir: 0, note: 'Warming up: waiting for confirmed swing closes' }
+    return { dir: structure.dir, note: structure.event }
+  }
+
   const look = Math.max(8, Math.round(p.window))
   if (history.length < look + 1) return { dir: 0, note: 'Warming up' }
   const window = history.slice(-look - 1, -1)
@@ -417,6 +628,112 @@ export function signalFor(
   if (last > high) return { dir: 1, note: `New ${look}-tick high` }
   if (last < low) return { dir: -1, note: `New ${look}-tick low` }
   return { dir: 0, note: 'Inside the recent range' }
+}
+
+/** Classifies only the supplied close series; callers must retain its source label. */
+export function marketCondition(history: number[]): MarketCondition {
+  if (history.length < 60 || history.some((value) => !Number.isFinite(value) || value <= 0)) {
+    return { regime: 'Warming up', volatilityPct: 0 }
+  }
+
+  const returns = history.slice(1).map((value, i) => Math.abs((value / history[i] - 1) * 100))
+  const recent = returns.slice(-20)
+  const baseline = returns.slice(-60, -20)
+  const mean = (values: number[]) =>
+    values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0
+  const volatilityPct = mean(recent)
+  const baselineVolatility = mean(baseline)
+  if (
+    volatilityPct > 0 &&
+    (baselineVolatility === 0 || volatilityPct >= baselineVolatility * 1.8)
+  ) {
+    return { regime: 'High volatility', volatilityPct }
+  }
+
+  const fast = sma(history, 12)
+  const slow = sma(history, 48)
+  const window = history.slice(-48)
+  let pathLength = 0
+  for (let i = 1; i < window.length; i++) pathLength += Math.abs(window[i] - window[i - 1])
+  const efficiency =
+    pathLength > 0 ? Math.abs(window[window.length - 1] - window[0]) / pathLength : 0
+  const gapPct = fast !== null && slow !== null ? (Math.abs(fast - slow) / slow) * 100 : 0
+
+  if (fast !== null && slow !== null && efficiency >= 0.35 && gapPct >= volatilityPct * 1.5) {
+    return { regime: fast > slow ? 'Uptrend' : 'Downtrend', volatilityPct }
+  }
+  return { regime: 'Ranging', volatilityPct }
+}
+
+/**
+ * Selects a rule-compatible setup for the current tape. This is a heuristic
+ * fit, not a performance forecast; simulated history remains paper-only.
+ */
+export function matchStrategyToMarket(instrument: Instrument, cfg: BotConfig): StrategyMatch {
+  const condition = marketCondition(instrument.history)
+  if (condition.regime === 'Warming up' || condition.regime === 'High volatility') {
+    return { ...condition, strategy: null, dir: 0, reason: 'No setup: wait for a clearer market' }
+  }
+
+  const preferred: StrategyId[] =
+    condition.regime === 'Uptrend' || condition.regime === 'Downtrend'
+      ? ['ict', 'momentum', 'breakout', 'macd', 'dip']
+      : ['support', 'meanrev', 'rsi']
+  const expectedDir = condition.regime === 'Downtrend' ? -1 : 1
+  let fallback: StrategyMatch | null = null
+
+  for (const strategy of preferred) {
+    if (!tradesClass(strategy, instrument.cls)) continue
+    const tuning = { ...defaultParams(strategy), ...(cfg.params[strategy] ?? {}) }
+    const signal = signalFor(strategy, instrument.history, tuning, pipSize(instrument.price, instrument.cls))
+    const match: StrategyMatch = {
+      ...condition,
+      strategy,
+      dir: signal.dir,
+      reason:
+        signal.dir === expectedDir
+          ? `${condition.regime}: ${signal.note}`
+          : `${condition.regime}: ${signal.note}; no aligned entry`,
+    }
+    if (!fallback) fallback = match
+    if (signal.dir === expectedDir) return match
+  }
+
+  return (
+    fallback ?? {
+      ...condition,
+      strategy: null,
+      dir: 0,
+      reason: `No supported strategy for ${instrument.cls}`,
+    }
+  )
+}
+
+/** Cash exposure that keeps the configured stop loss within the risk budget. */
+export function sizeForStopRisk(
+  equity: number,
+  riskPct: number,
+  stopLossPct: number,
+  allocationRoom: number,
+  availableCash: number,
+  recentMovePct = 0,
+): number {
+  if (
+    ![equity, riskPct, stopLossPct, allocationRoom, availableCash, recentMovePct].every(
+      Number.isFinite,
+    ) ||
+    equity <= 0 ||
+    riskPct <= 0 ||
+    stopLossPct <= 0 ||
+    recentMovePct < 0
+  ) {
+    return 0
+  }
+  const riskBudget = equity * (riskPct / 100)
+  const sizingDistancePct = Math.max(stopLossPct, Math.min(25, recentMovePct * 3))
+  const stopFraction = sizingDistancePct / 100
+  const riskSizedNotional = riskBudget / stopFraction
+  return Math.max(0, Math.min(riskSizedNotional, allocationRoom, availableCash))
 }
 
 function reading(label: string, value: number): IndicatorReading {
@@ -548,6 +865,38 @@ export function indicatorReadings(
     ]
   }
 
+  if (strategy === 'support') {
+    const levels = supportResistanceLevels(history, Math.max(12, Math.round(p.look)))
+    const distance = (level: number | null) =>
+      level === null ? '—' : `${(((last - level) / level) * 100).toFixed(2)}%`
+    return [
+      { label: 'Level method', value: 'Confirmed close pivots' },
+      { label: 'Support', value: levels.support === null ? '—' : levels.support.toFixed(4) },
+      { label: 'Resistance', value: levels.resistance === null ? '—' : levels.resistance.toFixed(4) },
+      { label: 'Support distance', value: distance(levels.support) },
+    ]
+  }
+
+  if (strategy === 'ict') {
+    const structure = ictCloseStructure(
+      history,
+      Math.max(12, Math.round(p.look)),
+      Math.max(1, Math.round(p.pivot)),
+    )
+    return [
+      { label: 'Structure', value: structure?.event ?? 'Warming up' },
+      {
+        label: 'Confirmed swing high',
+        value: structure ? structure.swingHigh.toFixed(4) : '—',
+      },
+      {
+        label: 'Confirmed swing low',
+        value: structure ? structure.swingLow.toFixed(4) : '—',
+      },
+      { label: 'Sweep method', value: 'Close-only proxy' },
+    ]
+  }
+
   const look = Math.max(8, Math.round(p.window))
   if (history.length < look + 1) return []
   const window = history.slice(-look - 1, -1)
@@ -600,7 +949,7 @@ export function runBotStep(
    * the cooldown untouched) while exits still run, so a risk or session limit
    * can never trap an open position.
    */
-  entryBlock?: (ins: Instrument) => string | null,
+  entryBlock?: (ins: Instrument, proposedNotional: number) => string | null,
 ): BotStepResult {
   let portfolio = start
   const fills: Fill[] = []
@@ -612,17 +961,21 @@ export function runBotStep(
       return sum + held.qty * (ins?.price ?? 0)
     }, 0)
 
-  const tuning = tunedParams(cfg)
-  const risk = activeRisk(cfg)
-  const rest = cooldownFor(cfg.strategy)
-
   for (const ins of instruments) {
     if (!cfg.classes.includes(ins.cls)) continue
-    if (!tradesClass(cfg.strategy, ins.cls)) continue
+    const match = cfg.strategyMode === 'market-fit' ? matchStrategyToMarket(ins, cfg) : null
+    const strategy = match?.strategy ?? cfg.strategy
+    if (!tradesClass(strategy, ins.cls)) continue
+    const rest = cooldownFor(strategy)
     if (tick - (cooldowns[ins.symbol] ?? -999) < rest) continue
 
+    const tuning =
+      cfg.strategyMode === 'market-fit'
+        ? { ...defaultParams(strategy), ...(cfg.params[strategy] ?? {}) }
+        : tunedParams(cfg)
+    const risk = riskFor(cfg, strategy)
     const pip = pipSize(ins.price, ins.cls)
-    const signal = signalFor(cfg.strategy, ins.history, tuning, pip)
+    const signal = signalFor(strategy, ins.history, tuning, pip)
     const held = portfolio.holdings[ins.symbol]
     let side: 'buy' | 'sell' | null = null
     let qty = 0
@@ -646,10 +999,20 @@ export function runBotStep(
         qty = held.qty
         reason = signal.note
       }
-    } else if (signal.dir > 0) {
+    } else if (
+      signal.dir > 0 &&
+      (cfg.strategyMode !== 'market-fit' || (match?.strategy && match.dir === 1))
+    ) {
       const equity = portfolio.cash + holdingsValue()
       const room = equity * (cfg.maxAllocPct / 100) - holdingsValue()
-      const budget = Math.min(equity * (risk.riskPct / 100), room, portfolio.cash)
+      const budget = sizeForStopRisk(
+        equity,
+        risk.riskPct,
+        risk.stopLossPct,
+        room,
+        portfolio.cash,
+        marketCondition(ins.history).volatilityPct,
+      )
       if (budget > Math.max(20, equity * 0.005)) {
         side = 'buy'
         qty = budget / ins.price
@@ -660,12 +1023,20 @@ export function runBotStep(
     if (!side || qty <= 0) continue
 
     if (side === 'buy' && entryBlock) {
-      if (entryBlock(ins)) continue
+      if (entryBlock(ins, qty * ins.price)) continue
     }
 
     cooldowns[ins.symbol] = tick
 
-    const readings = indicatorReadings(cfg.strategy, ins.history, tuning, pip)
+    const readings = [
+      ...indicatorReadings(strategy, ins.history, tuning, pip),
+      ...(cfg.strategyMode === 'market-fit' && match
+        ? [
+            { label: 'Market regime', value: match.regime },
+            { label: 'History source', value: ins.historyVerified ? 'Verified bars' : 'Simulated' },
+          ]
+        : []),
+    ]
 
     if (route) {
       intents.push({
@@ -674,7 +1045,7 @@ export function runBotStep(
         qty,
         price: ins.price,
         reason,
-        strategy: cfg.strategy,
+        strategy,
         indicators: readings,
       })
       continue
@@ -694,7 +1065,7 @@ export function runBotStep(
       source: 'bot',
       reason,
       pnl: result.pnl,
-      strategy: cfg.strategy,
+      strategy,
       indicators: readings,
     })
   }

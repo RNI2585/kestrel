@@ -27,6 +27,8 @@ export interface Instrument {
   source?: string
   /** When the live price was last applied. */
   liveAt?: number
+  /** True only when history came from a validated historical market-data feed. */
+  historyVerified?: boolean
 }
 
 /** One live price a feed returns, already normalised to US dollars. */
@@ -112,6 +114,7 @@ export class MarketEngine {
         history,
         vol: d.vol,
         base: d.base,
+        historyVerified: false,
       }
     })
   }
@@ -122,15 +125,24 @@ export class MarketEngine {
 
   /**
    * Anchors instruments to live quotes: the history is rescaled so the chart
-   * joins the real price, the day's reference close comes from the feed, and
-   * the simulation's drift then works around that price instead of its own.
+   * joins the real price, and the day's reference close comes from the feed.
+   * Live instruments stay at the last provider quote until the next update.
    * Returns how many instruments were updated.
    */
   applyLive(updates: Record<string, QuoteUpdate>): number {
     let applied = 0
     for (const ins of this.instruments) {
       const quote = updates[ins.symbol]
-      if (!quote || !Number.isFinite(quote.price) || quote.price <= 0) continue
+      if (
+        !quote ||
+        !Number.isFinite(quote.price) ||
+        quote.price <= 0 ||
+        !Number.isFinite(quote.at) ||
+        quote.at <= 0 ||
+        quote.at > Date.now() + 30_000
+      ) {
+        continue
+      }
       const ratio = quote.price / ins.price
       if (!Number.isFinite(ratio) || ratio <= 0) continue
       ins.history = ins.history.map((p) => p * ratio)
@@ -148,6 +160,8 @@ export class MarketEngine {
 
   tick(): void {
     for (const ins of this.instruments) {
+      // Never turn a last live quote into a synthetic price.
+      if (ins.live) continue
       const shock = randn() * ins.vol
       const pull = ((ins.base - ins.price) / ins.base) * 0.002
       let next = ins.price * (1 + shock + pull)

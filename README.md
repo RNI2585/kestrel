@@ -1,8 +1,9 @@
 # Kestrel — paper trading terminal
 
-A self-contained terminal for paper trading stocks, metals, FX, energy and crypto. Everything
-runs in the browser: the market feed is simulated locally, the account is a simulated ledger, and
-no server ever sees your state. It also installs as an app on a phone or desktop and works offline.
+A browser-based terminal for paper trading stocks, metals, FX, energy and crypto. The account is
+a simulated ledger stored locally; crypto, metals and FX can use public quote feeds, and optional
+broker or quote bridges receive requests only when you configure them. Kestrel has no account
+backend. It also installs as an app on a phone or desktop and works offline.
 
 ## Run it locally
 
@@ -90,15 +91,53 @@ move an account between them with **Export / Import** in the Account panel.
 
 ## Broker connections
 
-Broker keys are stored locally in plain text in `localStorage`. If you connect a real venue:
+Broker keys are held in memory while the page is open; they are not saved to `localStorage` or
+included in backups, so you need to re-enter them after a reload. The browser sends them to the
+endpoint you configure. If you connect a real venue:
 
 - use paper or read-only keys where the venue offers them, and disable withdrawals;
 - keep them in a local copy of the terminal rather than a shared computer;
-- assume only the paper ledger is proven. Exchanges reject direct browser calls (CORS), so routing
-  to a live venue needs your own proxy/bridge at the endpoint you configure, and that path has not
-  been tested against a real account here.
+- remote endpoints must use HTTPS; HTTP is accepted only for localhost bridges;
+- the browser books external orders only when the response includes confirmed fill quantity and
+  average price. Accepted orders stay unbooked; partial fills are booked only for the confirmed
+  quantity, and the unfilled remainder is not tracked here;
+- accepted/unknown order acknowledgements are written to the desk log, but this client does not
+  poll or cancel them. For custom bridges, return `orderId`, `status`, `filledQty` and
+  `averagePrice` for confirmed executions;
+- broker-routed stop/target exits leave the local position open until a fill is confirmed. An
+  accepted or unknown exit suppresses retries only for the current app session; reconcile the venue
+  before retrying after a reload;
+- a timeout or server error can leave the outcome unknown. Check the venue and reconcile before
+  retrying. The live broker path has not been validated against real accounts and is not a
+  production brokerage integration.
 
 The account is long-only by design: sells reduce or close an existing position.
+
+## Market fit, risk and backtests
+
+The optional **Market fit** bot mode chooses from the existing strategies using a simple
+trend/range and volatility heuristic. The fit is an educational rule match, not a forecast or
+profitability ranking. It reads the chart history shown in the app; that history is currently
+simulated, even when the latest quote is live. Broker-routed automated entries therefore remain
+paused until a verified historical-candle feed is integrated. Paper trading and manual orders are
+not affected by that automation gate.
+
+Bot position sizes use a configurable equity-risk budget at the stop distance, with size reduced
+when recent price movement implies a wider risk distance and always capped by cash and the
+allocation limit. An asset-class exposure cap blocks bot entries and approved bot proposals that
+would exceed the configured concentration limit. These controls limit modeled exposure; gaps,
+slippage, venue behavior and other risks can still produce larger losses.
+
+Backtests replay synthetic price paths with configurable estimated spread and slippage. They are
+not historical-market tests and do not predict future results.
+
+The strategy book also includes close-pivot support/resistance and ICT-style close-structure
+signals. These are original, explainable rule-based approximations, not copied TradingView scripts.
+This app currently has close-only simulated chart history, not OHLC candles: wick-based sweeps, fair
+value gaps and order blocks are therefore not calculated.
+
+The Cloudflare Worker adds baseline content-security and browser security headers. If you deploy
+the `dist/` folder on another static host, configure equivalent response headers there.
 
 ## Layout
 
@@ -107,7 +146,7 @@ The account is long-only by design: sells reduce or close an existing position.
 | Watchlist / chart | Instruments across five asset classes, 1H / 1D / 1W ranges |
 | Trade setup | Market and limit orders, venue selector, open position |
 | Current trades | Account, positions, equity curve, working orders, activity |
-| Bot & backtest | Seven strategies with per-strategy risk, stop and target; sweep and apply |
+| Bot & backtest | Ten strategies with per-strategy risk, stop and target; sweep and apply |
 | Broker connections | Local venue list, keys, connection test, routing |
 | Scripts | Chart-derived plans and plain-English instructions |
 

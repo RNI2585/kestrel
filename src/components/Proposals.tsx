@@ -9,6 +9,7 @@ interface Props {
 
 const STATUS_LABEL: Record<Proposal['status'], string> = {
   pending: 'Waiting',
+  accepted: 'Sent',
   approved: 'Approved',
   skipped: 'Skipped',
   expired: 'Stale',

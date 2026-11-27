@@ -143,9 +143,9 @@ export default function StrategiesTab({
             <Slider
               label="Risk per trade"
               value={risk.riskPct}
-              min={1}
-              max={10}
-              step={0.5}
+              min={0.01}
+              max={3}
+              step={0.01}
               display={`${risk.riskPct}% of equity`}
               onChange={(riskPct) => onChange(patchRisk(bot, { riskPct }))}
             />
@@ -171,6 +171,11 @@ export default function StrategiesTab({
               The stop and take profit are stamped on a trade once, from the setting that opened it
               — a bot entry on auto, or a proposal you approve. It keeps those levels until it
               closes, so arming a different strategy never moves an open trade’s target.
+            </p>
+            <p className="hint">
+              Risk per trade is the loss budget at the stop, not the amount invested. Position
+              sizing uses the wider of the configured stop and three recent average price moves,
+              then respects cash and the account allocation cap.
             </p>
             {riskTuned && (
               <button className="link-btn link-btn--block" onClick={resetRisk}>
@@ -231,6 +236,21 @@ export default function StrategiesTab({
                 {scan ? `${scan.regime} · ${scan.atrPct.toFixed(2)}% noise` : 'warming up'}
               </span>
             </header>
+            <p className="hint">
+              {scan?.recommendation.strategy
+                ? `Market fit: ${
+                    STRATEGIES.find((item) => item.id === scan.recommendation.strategy)?.name
+                  } — ${scan.recommendation.reason}.`
+                : (scan?.recommendation.reason ?? 'Waiting for enough price observations.')}
+              {!instrument.historyVerified &&
+                ' This chart history is simulated; use the fit for paper research only.'}
+            </p>
+            <p className="hint">
+              Support / resistance uses confirmed close pivots. ICT-style structure and failed-break
+              readings are also close-only proxies; fair value gaps, wick sweeps and order blocks need
+              OHLC candles, which this app does not currently have. These are original rule-based
+              implementations, not copied TradingView scripts.
+            </p>
             {readings.length === 0 ? (
               <p className="hint">Warming up — not enough ticks yet for {strategy.name}.</p>
             ) : (
@@ -264,7 +284,7 @@ export default function StrategiesTab({
             )}
             <p className="hint">
               Readings come from the armed model on the desk’s instrument; the votes are every
-              model’s call on the same tape.
+              model’s call on the same tape. Market fit is a rule-based suggestion, not a forecast.
             </p>
           </section>
 
