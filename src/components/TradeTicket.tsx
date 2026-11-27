@@ -4,6 +4,8 @@ import type { Instrument } from '../market'
 import { defineBroker, paperConnection, venueSymbol, type BrokerConnection } from '../brokers'
 import { money, price } from '../format'
 import { quoteStale } from '../session'
+import type { StrategyId } from '../bot'
+import type { IndicatorReading } from '../trade'
 
 interface Props {
   instrument: Instrument
@@ -14,12 +16,21 @@ interface Props {
   maxQuoteAgeSec: number
   /** The routed venue is the one saved for this instrument's asset class. */
   remembered: boolean
+  recommendation: {
+    strategy: StrategyId | null
+    dir: -1 | 0 | 1
+    reason: string
+    regime: string
+    verifiedHistory: boolean
+    indicators: IndicatorReading[]
+  }
   onRoute: (id: string) => void
   onSubmit: (
     side: Side,
     qty: number,
     type: OrderType,
     limit: number,
+    setup?: { strategy: StrategyId; indicators: IndicatorReading[] },
   ) => Promise<{ ok: true } | { ok: false; error: string }>
 }
 
@@ -31,6 +42,7 @@ export default function TradeTicket({
   activeBrokerId,
   maxQuoteAgeSec,
   remembered,
+  recommendation,
   onRoute,
   onSubmit,
 }: Props) {
@@ -85,7 +97,16 @@ export default function TradeTicket({
       return
     }
     setPending(true)
-    const result = await onSubmit(side, validQty, type, validLimit)
+    const setup =
+      side === 'buy' &&
+      recommendation.strategy &&
+      recommendation.dir === 1
+        ? {
+            strategy: recommendation.strategy,
+            indicators: recommendation.indicators,
+          }
+        : undefined
+    const result = await onSubmit(side, validQty, type, validLimit, setup)
     setPending(false)
     if (!result.ok) {
       setError(result.error)
@@ -288,6 +309,14 @@ export default function TradeTicket({
                   activePair && activePair !== instrument.symbol ? ` as ${activePair}` : ''
                 }.`
               : 'External orders are disabled until this instrument has a fresh live quote.'}
+      </p>
+
+      <p className="ticket__setup">
+        {recommendation.strategy
+          ? `Market fit: ${recommendation.strategy} · ${recommendation.regime} · ${
+              recommendation.verifiedHistory ? 'verified bars' : 'simulated history, paper research only'
+            }. ${recommendation.reason}`
+          : recommendation.reason}
       </p>
 
       {blocked && (

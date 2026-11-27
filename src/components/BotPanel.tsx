@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { STRATEGIES, type BotConfig } from '../bot'
+import { DEFAULT_RISK, STRATEGIES, type BotConfig } from '../bot'
 import { ASSET_CLASSES, type AssetClass } from '../market'
 import { money } from '../format'
 
@@ -77,7 +77,27 @@ export default function BotPanel({ bot, onChange, stats, instruments, brokerLabe
           : 'The bot trades the same cash balance you do. Stop it any time.'}
       </p>
       <p className="hint">
-        {strategy?.name} is armed. Its tuning, stop and take profit live in the Strategies tab.
+        {bot.strategyMode === 'market-fit'
+          ? 'Each instrument may use a different model and its own saved settings.'
+          : `${strategy?.name} is armed. Its tuning, stop and take profit live in the Strategies tab.`}
+      </p>
+
+      <label className="field">
+        <span>Strategy selection</span>
+        <select
+          value={bot.strategyMode}
+          onChange={(e) =>
+            onChange({ strategyMode: e.target.value === 'market-fit' ? 'market-fit' : 'fixed' })
+          }
+        >
+          <option value="fixed">Use the armed strategy</option>
+          <option value="market-fit">Match a strategy to each market</option>
+        </select>
+      </label>
+      <p className="hint">
+        {bot.strategyMode === 'market-fit'
+          ? `Per-market matching is heuristic and paper-only with today’s simulated chart history. Position size is capped by the risk budget (default ${DEFAULT_RISK[bot.strategy].riskPct}%) and uses the wider of the configured stop and three recent average moves; the actual stop remains unchanged. Broker-routed bot entries stay blocked until verified historical bars are available.`
+          : 'Market matching can be enabled to choose among strategies separately for each instrument.'}
       </p>
 
       <Slider
@@ -103,7 +123,7 @@ export default function BotPanel({ bot, onChange, stats, instruments, brokerLabe
       </label>
       <p className="hint">
         {brokerLabel
-          ? `With ${brokerLabel} routed, each bot order is sent to the venue and only booked in the terminal once the venue accepts it.`
+          ? `With ${brokerLabel} routed, bot entries require both a fresh quote and verified historical bars. Current charts use simulated history, so automated broker entries are paused; manual orders remain available with a fresh quote.`
           : 'Link a broker in Broker connections and route it there to send the bot’s orders to a real venue.'}
       </p>
 

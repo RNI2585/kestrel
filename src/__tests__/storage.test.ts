@@ -59,11 +59,40 @@ describe('saved portfolio validation', () => {
     })
     expect(bot.maxAllocPct).toBe(100)
     expect(bot.riskPrefs.momentum).toEqual({
-      riskPct: 10,
+      riskPct: 1,
       stopLossPct: 10,
       takeProfitPct: 2,
     })
     expect(bot.params.momentum).toEqual({ fast: 40, slow: 20 })
+  })
+
+  it('preserves stop-risk settings already written by the current schema', () => {
+    const bot = loadBot({
+      strategyMode: 'market-fit',
+      riskSizingVersion: 1,
+      riskPrefs: { momentum: { riskPct: 2.5, stopLossPct: 2, takeProfitPct: 6 } },
+    })
+
+    expect(bot.strategyMode).toBe('market-fit')
+    expect(bot.riskPrefs.momentum).toEqual({
+      riskPct: 2.5,
+      stopLossPct: 2,
+      takeProfitPct: 6,
+    })
+  })
+
+  it('migrates legacy allocation risk without overstating or inventing a saved risk value', () => {
+    expect(
+      loadBot({
+        riskPrefs: { momentum: { riskPct: 2, stopLossPct: 2, takeProfitPct: 6 } },
+      }).riskPrefs.momentum?.riskPct,
+    ).toBe(0.04)
+
+    expect(
+      loadBot({
+        riskPrefs: { momentum: { stopLossPct: 2, takeProfitPct: 6 } },
+      }).riskPrefs.momentum?.riskPct,
+    ).toBe(1)
   })
 
   it('bounds restored proposal drift settings', () => {

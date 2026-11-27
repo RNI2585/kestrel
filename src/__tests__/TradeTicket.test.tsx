@@ -42,6 +42,14 @@ function renderTicket(ins: Instrument) {
       activeBrokerId={bridge.id}
       maxQuoteAgeSec={180}
       remembered={false}
+      recommendation={{
+        strategy: null,
+        dir: 0,
+        reason: 'Warming up',
+        regime: 'Warming up',
+        verifiedHistory: false,
+        indicators: [],
+      }}
       onRoute={vi.fn()}
       onSubmit={vi.fn(async () => ({ ok: true as const }))}
     />,

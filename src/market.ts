@@ -27,6 +27,8 @@ export interface Instrument {
   source?: string
   /** When the live price was last applied. */
   liveAt?: number
+  /** True only when history came from a validated historical market-data feed. */
+  historyVerified?: boolean
 }
 
 /** One live price a feed returns, already normalised to US dollars. */
@@ -112,6 +114,7 @@ export class MarketEngine {
         history,
         vol: d.vol,
         base: d.base,
+        historyVerified: false,
       }
     })
   }

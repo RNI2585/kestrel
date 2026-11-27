@@ -14,6 +14,14 @@ const RISK_FIELDS: {
 }[] = [
   { key: 'maxDailyLossPct', label: 'Daily loss limit', unit: '%', min: 0.1, max: 50, step: 0.1 },
   { key: 'maxExposurePct', label: 'Max exposure', unit: '%', min: 5, max: 500, step: 5 },
+  {
+    key: 'maxClassExposurePct',
+    label: 'Max exposure per asset class',
+    unit: '%',
+    min: 5,
+    max: 100,
+    step: 5,
+  },
   { key: 'maxPositions', label: 'Max open positions', unit: '', min: 1, max: 50, step: 1 },
   { key: 'maxTradesPerDay', label: 'Max entries a day', unit: '', min: 1, max: 500, step: 1 },
   { key: 'maxConsecutiveLosses', label: 'Pause after losers in a row', unit: '', min: 1, max: 50, step: 1 },

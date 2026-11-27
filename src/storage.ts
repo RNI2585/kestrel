@@ -219,6 +219,7 @@ export function loadBot(raw: unknown): BotConfig {
   const strategy = STRATEGIES.some((s) => s.id === stored.strategy)
     ? (stored.strategy as StrategyId)
     : DEFAULT_BOT.strategy
+  const migratedRisk = stored.riskSizingVersion !== 1
 
   const riskPrefs: Partial<Record<StrategyId, RiskSettings>> = {}
   const savedPrefs = isRecord(stored.riskPrefs) ? stored.riskPrefs : {}
@@ -227,9 +228,19 @@ export function loadBot(raw: unknown): BotConfig {
       const saved = savedPrefs[s.id]
       if (!isRecord(saved)) continue
       const defaults = DEFAULT_RISK[s.id]
+      const stopLossPct = boundedNumber(saved.stopLossPct, defaults.stopLossPct, 1, 10)
+      const hasSavedRisk = typeof saved.riskPct === 'number' && Number.isFinite(saved.riskPct)
+      const previousSizingPct = boundedNumber(saved.riskPct, defaults.riskPct, 1, 10)
       riskPrefs[s.id] = {
-        riskPct: boundedNumber(saved.riskPct, defaults.riskPct, 1, 10),
-        stopLossPct: boundedNumber(saved.stopLossPct, defaults.stopLossPct, 1, 10),
+        riskPct: migratedRisk && hasSavedRisk
+          ? boundedNumber(
+              (previousSizingPct * stopLossPct) / 100,
+              defaults.riskPct,
+              0.01,
+              3,
+            )
+          : boundedNumber(saved.riskPct, defaults.riskPct, 0.01, 3),
+        stopLossPct,
         takeProfitPct: boundedNumber(saved.takeProfitPct, defaults.takeProfitPct, 2, 25),
       }
     }
@@ -240,15 +251,30 @@ export function loadBot(raw: unknown): BotConfig {
       stored.stopLossPct !== undefined ||
       stored.takeProfitPct !== undefined)
   ) {
+    const stopLossPct = boundedNumber(
+      stored.stopLossPct,
+      DEFAULT_RISK[strategy].stopLossPct,
+      1,
+      10,
+    )
+    const previousSizingPct = boundedNumber(
+      stored.riskPct,
+      DEFAULT_RISK[strategy].riskPct,
+      1,
+      10,
+    )
+    const hasSavedRisk = typeof stored.riskPct === 'number' && Number.isFinite(stored.riskPct)
     riskPrefs[strategy] = {
       ...DEFAULT_RISK[strategy],
-      riskPct: boundedNumber(stored.riskPct, DEFAULT_RISK[strategy].riskPct, 1, 10),
-      stopLossPct: boundedNumber(
-        stored.stopLossPct,
-        DEFAULT_RISK[strategy].stopLossPct,
-        1,
-        10,
-      ),
+      riskPct: migratedRisk && hasSavedRisk
+        ? boundedNumber(
+            (previousSizingPct * stopLossPct) / 100,
+            DEFAULT_RISK[strategy].riskPct,
+            0.01,
+            3,
+          )
+        : boundedNumber(stored.riskPct, DEFAULT_RISK[strategy].riskPct, 0.01, 3),
+      stopLossPct,
       takeProfitPct: boundedNumber(
         stored.takeProfitPct,
         DEFAULT_RISK[strategy].takeProfitPct,
@@ -277,6 +303,7 @@ export function loadBot(raw: unknown): BotConfig {
     ...DEFAULT_BOT,
     running: stored.running === true,
     strategy,
+    strategyMode: stored.strategyMode === 'market-fit' ? 'market-fit' : 'fixed',
     maxAllocPct: boundedNumber(stored.maxAllocPct, DEFAULT_BOT.maxAllocPct, 20, 100),
     classes: Array.isArray(stored.classes)
       ? stored.classes.filter((c): c is AssetClass => ASSET_CLASSES.includes(c))

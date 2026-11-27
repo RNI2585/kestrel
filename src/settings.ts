@@ -114,7 +114,7 @@ export interface Proposal {
   /** Price when the signal fired, kept to detect a faded setup. */
   price: number
   reason: string
-  status: 'pending' | 'approved' | 'skipped' | 'expired'
+  status: 'pending' | 'accepted' | 'approved' | 'skipped' | 'expired'
   note?: string
   /** The strategy and its indicator readings when the signal fired. */
   strategy?: StrategyId

@@ -104,11 +104,37 @@ endpoint you configure. If you connect a real venue:
 - accepted/unknown order acknowledgements are written to the desk log, but this client does not
   poll or cancel them. For custom bridges, return `orderId`, `status`, `filledQty` and
   `averagePrice` for confirmed executions;
+- broker-routed stop/target exits leave the local position open until a fill is confirmed. An
+  accepted or unknown exit suppresses retries only for the current app session; reconcile the venue
+  before retrying after a reload;
 - a timeout or server error can leave the outcome unknown. Check the venue and reconcile before
   retrying. The live broker path has not been validated against real accounts and is not a
   production brokerage integration.
 
 The account is long-only by design: sells reduce or close an existing position.
+
+## Market fit, risk and backtests
+
+The optional **Market fit** bot mode chooses from the existing strategies using a simple
+trend/range and volatility heuristic. The fit is an educational rule match, not a forecast or
+profitability ranking. It reads the chart history shown in the app; that history is currently
+simulated, even when the latest quote is live. Broker-routed automated entries therefore remain
+paused until a verified historical-candle feed is integrated. Paper trading and manual orders are
+not affected by that automation gate.
+
+Bot position sizes use a configurable equity-risk budget at the stop distance, with size reduced
+when recent price movement implies a wider risk distance and always capped by cash and the
+allocation limit. An asset-class exposure cap blocks bot entries and approved bot proposals that
+would exceed the configured concentration limit. These controls limit modeled exposure; gaps,
+slippage, venue behavior and other risks can still produce larger losses.
+
+Backtests replay synthetic price paths with configurable estimated spread and slippage. They are
+not historical-market tests and do not predict future results.
+
+The strategy book also includes close-pivot support/resistance and ICT-style close-structure
+signals. These are original, explainable rule-based approximations, not copied TradingView scripts.
+This app currently has close-only simulated chart history, not OHLC candles: wick-based sweeps, fair
+value gaps and order blocks are therefore not calculated.
 
 The Cloudflare Worker adds baseline content-security and browser security headers. If you deploy
 the `dist/` folder on another static host, configure equivalent response headers there.
@@ -120,7 +146,7 @@ the `dist/` folder on another static host, configure equivalent response headers
 | Watchlist / chart | Instruments across five asset classes, 1H / 1D / 1W ranges |
 | Trade setup | Market and limit orders, venue selector, open position |
 | Current trades | Account, positions, equity curve, working orders, activity |
-| Bot & backtest | Seven strategies with per-strategy risk, stop and target; sweep and apply |
+| Bot & backtest | Ten strategies with per-strategy risk, stop and target; sweep and apply |
 | Broker connections | Local venue list, keys, connection test, routing |
 | Scripts | Chart-derived plans and plain-English instructions |
 
