@@ -1,11 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   BROKER_DEFS,
+  closeVenuePosition,
+  probeBridge,
+  readVenuePositions,
   verifyBroker,
   type BrokerConnection,
   type BrokerDef,
   type BrokerGroup,
   type BrokerKind,
+  type VenuePosition,
 } from '../brokers'
 
 interface Props {
@@ -32,6 +36,9 @@ export default function Brokers({ connections, activeId, onSave, onRemove, onRou
   const [form, setForm] = useState<Draft>(BLANK)
   const [busy, setBusy] = useState<BrokerKind | null>(null)
   const [showSecrets, setShowSecrets] = useState(false)
+  const [venuePositions, setVenuePositions] = useState<Record<string, VenuePosition[]>>({})
+  const [venueNote, setVenueNote] = useState('')
+  const [venueBusy, setVenueBusy] = useState(false)
   const formRef = useRef<HTMLDivElement | null>(null)
 
   // A venue can sit far down the list, so bring its form into view when it opens.
@@ -60,6 +67,40 @@ export default function Brokers({ connections, activeId, onSave, onRemove, onRou
             orderPath: '',
           },
     )
+  }
+
+  /** Asks the bridge what it is configured with, without sending the token. */
+  const checkBridge = async (conn: BrokerConnection) => {
+    setVenueBusy(true)
+    setVenueNote('Asking the bridge…')
+    const message = await probeBridge(conn)
+    setVenueBusy(false)
+    setVenueNote(message)
+  }
+
+  /** Reads the venue's own open positions through the bridge. */
+  const loadPositions = async (conn: BrokerConnection) => {
+    setVenueBusy(true)
+    setVenueNote('Reading positions…')
+    const positions = await readVenuePositions(conn)
+    setVenueBusy(false)
+    setVenuePositions((prev) => ({ ...prev, [conn.id]: positions }))
+    setVenueNote(
+      positions.length === 0
+        ? 'The venue reports no open positions (or the bridge does not expose them).'
+        : `${positions.length} open position${positions.length === 1 ? '' : 's'} on the venue.`,
+    )
+  }
+
+  const closeOne = async (conn: BrokerConnection, position: VenuePosition) => {
+    if (!window.confirm(`Close ${position.side} ${position.qty} ${position.symbol} on the venue?`)) {
+      return
+    }
+    setVenueBusy(true)
+    const result = await closeVenuePosition(conn, position)
+    setVenueBusy(false)
+    setVenueNote(result.message)
+    if (result.ok) await loadPositions(conn)
   }
 
   const connect = async (def: BrokerDef) => {
@@ -296,6 +337,41 @@ export default function Brokers({ connections, activeId, onSave, onRemove, onRou
                             Remove
                           </button>
                         )}
+                      </div>
+                    )}
+
+                    {!isPaper && !editing && conn?.status === 'linked' && (
+                      <div className="broker__venue">
+                        <button
+                          className="broker__btn"
+                          disabled={venueBusy}
+                          onClick={() => checkBridge(conn)}
+                        >
+                          Bridge health
+                        </button>
+                        <button
+                          className="broker__btn"
+                          disabled={venueBusy}
+                          onClick={() => loadPositions(conn)}
+                        >
+                          Venue positions
+                        </button>
+                        {venueNote && <p className="broker__note">{venueNote}</p>}
+                        {(venuePositions[conn.id] ?? []).map((position) => (
+                          <div key={position.id} className="broker__position">
+                            <span>{position.symbol}</span>
+                            <span>
+                              {position.side} {position.qty}
+                            </span>
+                            <button
+                              className="broker__btn broker__btn--quiet"
+                              disabled={venueBusy}
+                              onClick={() => closeOne(conn, position)}
+                            >
+                              Close
+                            </button>
+                          </div>
+                        ))}
                       </div>
                     )}
                   </div>

@@ -35,6 +35,7 @@ import {
   PAPER_BROKER_ID,
   paperConnection,
   submitBrokerOrder,
+  venueFillPrice,
   venueSymbol,
   type BrokerConnection,
 } from './brokers'
@@ -935,6 +936,10 @@ export default function App() {
       const preview = applyOrder(portfolioRef.current, ins.symbol, ins.price, side, qty)
       if (!preview.ok) return preview
 
+      // A routed order books at the venue's own entry price when the bridge
+      // can report one, so the ledger does not drift from the real fill.
+      let fillPrice = ins.price
+
       if (activeBrokerConn.kind !== 'paper') {
         const routed = await submitBrokerOrder(activeBrokerConn, {
           symbol: ins.symbol,
@@ -955,9 +960,11 @@ export default function App() {
         brokersRef.current = nextBrokers
         setBrokers(nextBrokers)
         if (!routed.ok) return { ok: false, error: routed.message }
+        const booked = await venueFillPrice(activeBrokerConn, ins.symbol)
+        if (booked) fillPrice = booked
       }
 
-      const result = applyOrder(portfolioRef.current, ins.symbol, ins.price, side, qty)
+      const result = applyOrder(portfolioRef.current, ins.symbol, fillPrice, side, qty)
       if (!result.ok) return result
 
       const fill: Fill = {
@@ -966,7 +973,7 @@ export default function App() {
         symbol: ins.symbol,
         side,
         qty,
-        price: ins.price,
+        price: fillPrice,
         source: 'manual',
         reason:
           activeBrokerConn.kind === 'paper'

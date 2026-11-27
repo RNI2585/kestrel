@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -30,6 +33,14 @@ jobs:
 
       - run: npm ci
 
+      # The APK is only worth shipping if the code behind it compiles and the
+      # desk's own tests pass, so both run before Gradle.
+      - name: Typecheck, unit tests and bridge smoke check
+        run: |
+          npm run typecheck
+          npm test
+          node bridge/smoke.mjs
+
       - name: Build web assets and sync Android project
         run: npm run android:sync
 
@@ -42,3 +53,14 @@ jobs:
           name: kestrel-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      # A stable download URL for the phone: every push replaces the asset on
+      # this rolling release instead of piling up tags.
+      - name: Publish the APK to the rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-latest
+          name: Kestrel debug APK
+          body: Built from ${{ github.sha }} by the Android APK workflow.
+          files: android/app/build/outputs/apk/debug/app-debug.apk
+          make_latest: true

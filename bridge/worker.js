@@ -7,17 +7,28 @@
  * token, and the Worker signs the PrimeXBT request with a key that never leaves
  * Cloudflare.
  *
- * Routes, matching what the terminal's "Custom bridge" connection sends:
- *   GET  /account   prove the key works, return the account behind it
- *   POST /orders    place a market order (terminal symbol, buy/sell, qty)
- *   GET  /health    what this deployment is configured with, no secrets
+ * Routes:
+ *   GET  /account    prove the key works, return the account behind it
+ *   GET  /positions  the venue's open positions
+ *   POST /orders     place a market order (terminal symbol, buy/sell, qty)
+ *   POST /close      close the position in one symbol
+ *   POST /cancel     cancel one working order by id
+ *   GET  /health     what this deployment is configured with, no secrets
  *
  * Configuration (Cloudflare secrets, never in the repo and never in the app):
- *   PRIMEXBT_KEY_ID     the key id, as issued (starts pxk_)
- *   PRIMEXBT_SECRET     the Ed25519 private key, base64 PKCS#8
- *   BRIDGE_TOKEN        bearer token the terminal must present
- *   BRIDGE_SECRET       optional: a second credential, sent as X-Bridge-Key
- *   ALLOWED_ORIGIN      optional: pin CORS to one origin instead of *
+ *   PRIMEXBT_KEY_ID        the key id, as issued (starts pxk_)
+ *   PRIMEXBT_SECRET        the Ed25519 private key, base64 PKCS#8
+ *   BRIDGE_TOKEN           bearer token the terminal must present
+ *   BRIDGE_SECRET          optional: a second credential, sent as X-Bridge-Key
+ *   ALLOWED_ORIGIN         optional: pin CORS to one origin instead of *
+ *   ALLOWED_SYMBOLS        optional: comma list, e.g. BTC,ETH — everything else 400s
+ *   MAX_NOTIONAL           optional: largest order in USD; needs a reference price
+ *   RATE_LIMIT_PER_MINUTE  optional: requests per minute per client, default 30
+ *   CLOSE_PATH/CANCEL_PATH optional: venue paths, if they differ from the defaults
+ *
+ * The close and cancel paths are the venue paths this bridge assumes; they are
+ * overridable per deployment because PrimeXBT has not published them in the
+ * public reference. Anything the venue refuses is relayed verbatim.
  *
  * The bridge refuses to run without all three required values. A half-configured
  * deployment that accepts orders is worse than one that answers 503.
@@ -27,7 +38,10 @@ const BASE = 'https://www.primexbt.partners'
 const ACCOUNT_PATH = '/v3/trading/account'
 const POSITIONS_PATH = '/v3/trading/positions'
 const ORDER_PATH = '/v3/trading/orders/market/place'
+const DEFAULT_CLOSE_PATH = '/v3/trading/positions/close'
+const DEFAULT_CANCEL_PATH = '/v3/trading/orders/cancel'
 const UPSTREAM_TIMEOUT_MS = 8000
+const DEFAULT_RATE_LIMIT = 30
 
 const encoder = new TextEncoder()
 
@@ -52,6 +66,15 @@ const PAIRS = {
 
 export default {
   async fetch(request, env) {
+    const started = Date.now()
+    const response = await serve(request, env)
+    logRequest(request, response, started)
+    return response
+  },
+}
+
+/** Builds the response for one request; fetch() above logs and returns it. */
+async function serve(request, env) {
     const url = new URL(request.url)
     const cors = corsHeaders(env)
 
@@ -70,7 +93,18 @@ export default {
             token: Boolean(env.BRIDGE_TOKEN),
             secondKey: Boolean(env.BRIDGE_SECRET),
           },
-          routes: { account: 'GET /account', orders: 'POST /orders' },
+          limits: {
+            symbols: allowedSymbols(env),
+            maxNotional: Number(env.MAX_NOTIONAL) > 0 ? Number(env.MAX_NOTIONAL) : null,
+            rateLimitPerMinute: rateLimitOf(env),
+          },
+          routes: {
+            account: 'GET /account',
+            positions: 'GET /positions',
+            orders: 'POST /orders',
+            close: 'POST /close',
+            cancel: 'POST /cancel',
+          },
         },
         200,
         cors,
@@ -97,16 +131,33 @@ export default {
       )
     }
 
+    // Best effort: one isolate's counters. It stops a runaway loop from this
+    // client; it is not a distributed limiter.
+    if (rateLimited(env, clientKey(request))) {
+      return json({ error: 'Too many requests — slow down' }, 429, cors)
+    }
+
     if (url.pathname === '/account' && request.method === 'GET') {
       return account(env, cors)
+    }
+
+    if (url.pathname === '/positions' && request.method === 'GET') {
+      return relay(await callVenue(env, 'GET', POSITIONS_PATH), cors)
     }
 
     if (url.pathname === '/orders' && request.method === 'POST') {
       return order(request, env, cors)
     }
 
+    if (url.pathname === '/close' && request.method === 'POST') {
+      return close(request, env, cors)
+    }
+
+    if (url.pathname === '/cancel' && request.method === 'POST') {
+      return cancel(request, env, cors)
+    }
+
     return json({ error: `No route for ${request.method} ${url.pathname}` }, 404, cors)
-  },
 }
 
 async function account(env, cors) {
@@ -133,6 +184,9 @@ async function order(request, env, cors) {
   if (!symbol) {
     return json({ error: `Unknown instrument ${String(body.symbol)} — send BTC, ETH, SOL or a pair like BTC/USD` }, 400, cors)
   }
+  if (!symbolAllowed(env, symbol)) {
+    return json({ error: `${symbol} is not in ALLOWED_SYMBOLS on this deployment` }, 400, cors)
+  }
 
   const side = String(body.side ?? '').toUpperCase()
   if (side !== 'BUY' && side !== 'SELL') {
@@ -144,12 +198,90 @@ async function order(request, env, cors) {
     return json({ error: 'qty must be a positive number' }, 400, cors)
   }
 
+  const cap = Number(env.MAX_NOTIONAL)
+  if (Number.isFinite(cap) && cap > 0) {
+    const price = Number(body.reference_price ?? body.price)
+    if (!Number.isFinite(price) || price <= 0) {
+      return json(
+        { error: 'MAX_NOTIONAL is set, so the order needs reference_price to size it' },
+        400,
+        cors,
+      )
+    }
+    const notional = qty * price
+    if (notional > cap) {
+      return json(
+        {
+          error: `Order is $${notional.toFixed(2)} at the reference price, over the $${cap} cap on this deployment`,
+        },
+        400,
+        cors,
+      )
+    }
+  }
+
   const payload = { symbol, side, qty }
   const clientOrderId = cleanId(body.client_order_id ?? body.clientOrderId)
   if (clientOrderId) payload.clientOrderId = clientOrderId
 
   const result = await callVenue(env, 'POST', ORDER_PATH, payload)
   return relay(result, cors)
+}
+
+/** Closes the open position in one symbol. */
+async function close(request, env, cors) {
+  const body = await readJson(request, cors)
+  if (!body) return json({ error: 'Body must be JSON' }, 400, cors)
+
+  const symbol = normaliseSymbol(body.symbol)
+  if (!symbol) return json({ error: `Unknown instrument ${String(body.symbol)}` }, 400, cors)
+  if (!symbolAllowed(env, symbol)) {
+    return json({ error: `${symbol} is not in ALLOWED_SYMBOLS on this deployment` }, 400, cors)
+  }
+
+  const payload = { symbol }
+  const positionId = String(body.positionId ?? body.position_id ?? '').trim()
+  if (positionId) payload.positionId = positionId.slice(0, 64)
+  const qty = Number(body.qty)
+  if (Number.isFinite(qty) && qty > 0) payload.qty = qty
+
+  const path = (env.CLOSE_PATH ?? '').trim() || DEFAULT_CLOSE_PATH
+  return relay(await callVenue(env, 'POST', path, payload), cors)
+}
+
+/** Cancels one working order. */
+async function cancel(request, env, cors) {
+  const body = await readJson(request, cors)
+  if (!body) return json({ error: 'Body must be JSON' }, 400, cors)
+
+  const orderId = cleanId(body.orderId ?? body.order_id ?? body.clientOrderId)
+  if (!orderId) return json({ error: 'orderId is required' }, 400, cors)
+
+  const path = (env.CANCEL_PATH ?? '').trim() || DEFAULT_CANCEL_PATH
+  return relay(await callVenue(env, 'POST', path, { orderId }), cors)
+}
+
+async function readJson(request, cors) {
+  try {
+    const body = await request.json()
+    return body && typeof body === 'object' ? body : null
+  } catch {
+    return null
+  }
+}
+
+/** ALLOWED_SYMBOLS, normalised to venue pairs; empty means every mapped pair. */
+function allowedSymbols(env) {
+  const raw = (env.ALLOWED_SYMBOLS ?? '').trim()
+  if (!raw) return Object.values(PAIRS)
+  return raw
+    .split(',')
+    .map((part) => normaliseSymbol(part))
+    .filter(Boolean)
+}
+
+function symbolAllowed(env, venueSymbol) {
+  return allowedSymbols(env).includes(venueSymbol)
 }
 
 /** The venue's symbol for a terminal one, or null when it cannot be mapped. */
@@ -228,6 +360,53 @@ async function sign(env, method, path, query, bodyText) {
     'X-API-KEY': env.PRIMEXBT_KEY_ID,
     'X-API-TIMESTAMP': timestamp,
     'X-API-SIGNATURE': toBase64(signature),
+  }
+}
+
+function rateLimitOf(env) {
+  const value = Number(env.RATE_LIMIT_PER_MINUTE ?? DEFAULT_RATE_LIMIT)
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_RATE_LIMIT
+}
+
+const buckets = new Map()
+
+/** Sliding minute counter per client, inside this isolate only. */
+function rateLimited(env, key) {
+  const limit = rateLimitOf(env)
+  const now = Date.now()
+  const entry = buckets.get(key)
+  if (!entry || now - entry.start >= 60_000) {
+    if (buckets.size > 500) buckets.clear()
+    buckets.set(key, { start: now, count: 1 })
+    return false
+  }
+  entry.count += 1
+  return entry.count > limit
+}
+
+function clientKey(request) {
+  return (
+    request.headers.get('cf-connecting-ip') ??
+    request.headers.get('x-forwarded-for') ??
+    'unknown'
+  )
+}
+
+/** One line per request: method, path, status, duration. No tokens, no bodies. */
+function logRequest(request, response, started) {
+  try {
+    const url = new URL(request.url)
+    console.log(
+      JSON.stringify({
+        bridge: 'kestrel-primexbt',
+        method: request.method,
+        path: url.pathname,
+        status: response.status,
+        ms: Date.now() - started,
+      }),
+    )
+  } catch {
+    // logging must never break a request
   }
 }
 

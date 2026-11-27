@@ -639,6 +639,153 @@ function failureHint(conn: BrokerConnection, def: BrokerDef, err: unknown): stri
 }
 
 /**
+ * What a bridge reports about itself. Health is deliberately unauthenticated on
+ * the bridge, so this can say which secrets are missing before a token is even
+ * tried.
+ */
+export interface BridgeHealth {
+  bridge?: string
+  venue?: string
+  configured?: Record<string, boolean>
+  limits?: { symbols?: string[]; maxNotional?: number | null; rateLimitPerMinute?: number }
+  routes?: Record<string, string>
+  error?: string
+}
+
+export async function probeBridge(conn: BrokerConnection): Promise<string> {
+  const base = endpointOf(conn)
+  if (!base) return 'Add the bridge endpoint first.'
+  try {
+    const res = await withTimeout(`${base}/health`, { method: 'GET' })
+    const body = safeJson(await res.text()) as BridgeHealth | null
+    if (!res.ok || !body) return `The bridge answered ${res.status} without a health body.`
+    if (body.error) return `The bridge reported: ${body.error}`
+    const conf = body.configured ?? {}
+    const ready = conf.key && conf.secret && conf.token
+    const parts = Object.entries(conf).map(([name, on]) => `${name}: ${on ? 'set' : 'missing'}`)
+    const cap = body.limits?.maxNotional
+    const limit = body.limits?.rateLimitPerMinute
+    return [
+      `${body.bridge ?? 'Bridge'} ${ready ? 'is ready' : 'is not ready'} — ${parts.join(', ')}`,
+      cap ? `cap $${cap} per order` : 'no notional cap',
+      limit ? `${limit} req/min` : '',
+      body.limits?.symbols?.length ? body.limits.symbols.slice(0, 6).join(' ') : '',
+    ]
+      .filter(Boolean)
+      .join(' · ')
+  } catch (err) {
+    return failureHint(conn, defineBroker(conn.kind), err)
+  }
+}
+
+/** One open position on the venue, as far as the bridge's JSON allows. */
+export interface VenuePosition {
+  id: string
+  symbol: string
+  side: string
+  qty: number
+}
+
+function pick(source: Record<string, unknown>, names: string[]): unknown {
+  for (const name of names) {
+    const value = source[name]
+    if (value !== undefined && value !== null && value !== '') return value
+  }
+  return undefined
+}
+
+function positionList(json: unknown): Record<string, unknown>[] {
+  if (!json || typeof json !== 'object') return []
+  const body = json as Record<string, unknown>
+  for (const key of ['positions', 'data', 'result', 'items']) {
+    const value = body[key]
+    if (Array.isArray(value)) return value.filter((v): v is Record<string, unknown> => !!v && typeof v === 'object')
+    if (value && typeof value === 'object') {
+      const nested = positionList(value)
+      if (nested.length > 0) return nested
+    }
+  }
+  return []
+}
+
+export async function readVenuePositions(conn: BrokerConnection): Promise<VenuePosition[]> {
+  const base = endpointOf(conn)
+  if (!base) return []
+  const res = await withTimeout(`${base}/positions`, {
+    method: 'GET',
+    headers: bearerHeaders(conn.key.trim(), conn.secret),
+  })
+  if (!res.ok) return []
+  const json = safeJson(await res.text())
+  return positionList(json).map((row, index) => {
+    const symbol = String(pick(row, ['symbol', 'pair', 'instrument', 'market']) ?? '—')
+    const rawQty = pick(row, ['qty', 'quantity', 'size', 'amount', 'volume'])
+    const qty = Number(rawQty)
+    return {
+      id: String(pick(row, ['id', 'positionId', 'position_id']) ?? `${symbol}-${index}`),
+      symbol,
+      side: String(pick(row, ['side', 'direction', 'type']) ?? '—'),
+      qty: Number.isFinite(qty) ? qty : 0,
+    }
+  })
+}
+
+/** Asks the bridge to close one position. */
+export async function closeVenuePosition(
+  conn: BrokerConnection,
+  position: VenuePosition,
+): Promise<{ ok: boolean; message: string }> {
+  const base = endpointOf(conn)
+  if (!base) return { ok: false, message: 'No bridge endpoint set.' }
+  try {
+    const res = await withTimeout(`${base}/close`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...bearerHeaders(conn.key.trim(), conn.secret) },
+      body: JSON.stringify({
+        symbol: position.symbol,
+        positionId: position.id,
+        ...(position.qty > 0 ? { qty: position.qty } : {}),
+      }),
+    })
+    const body = safeJson(await res.text())
+    if (!res.ok) {
+      const detail = venueError(body)
+      return { ok: false, message: `Close refused (${res.status})${detail ? ` — ${detail}` : ''}.` }
+    }
+    return { ok: true, message: `Close sent for ${position.symbol}.` }
+  } catch (err) {
+    return { ok: false, message: failureHint(conn, defineBroker(conn.kind), err) }
+  }
+}
+
+/**
+ * The venue's own entry price for a symbol, when the bridge exposes positions
+ * in a shape this can read. Null means the terminal keeps its reference price.
+ */
+export async function venueFillPrice(
+  conn: BrokerConnection,
+  symbol: string,
+): Promise<number | null> {
+  const base = endpointOf(conn)
+  if (!base) return null
+  const wanted = venueSymbol(conn.kind, symbol) ?? symbol
+  try {
+    const res = await withTimeout(`${base}/positions`, {
+      method: 'GET',
+      headers: bearerHeaders(conn.key.trim(), conn.secret),
+    })
+    if (!res.ok) return null
+    const rows = positionList(safeJson(await res.text()))
+    const row = rows.find((r) => String(pick(r, ['symbol', 'pair', 'instrument', 'market']) ?? '') === wanted)
+    if (!row) return null
+    const price = Number(pick(row, ['entryPrice', 'avgPrice', 'averagePrice', 'openPrice', 'price']))
+    return Number.isFinite(price) && price > 0 ? price : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Verifies the connection by asking the endpoint for the account behind the
  * key. Anything the browser cannot reach (CORS, bad key, wrong path) is
  * reported, never treated as a success.

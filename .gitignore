@@ -10,3 +10,6 @@ android/.gradle/
 android/app/build/
 *.jks
 *.keystore
+
+# bridge credentials written by the local setup form
+.secrets/
