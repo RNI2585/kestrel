@@ -13,3 +13,5 @@ android/app/build/
 
 # bridge credentials written by the local setup form
 .secrets/
+.reveal/
+.probe/

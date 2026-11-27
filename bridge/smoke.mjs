@@ -52,6 +52,25 @@ check('cap without price 400', res.status === 400, (await res.json()).error)
 res = await call('POST', '/orders', { body: { symbol: 'BTC', side: 'hold', qty: 0.001, reference_price: 69000 } })
 check('bad side 400', res.status === 400)
 
+res = await call('POST', '/orders', { body: { symbol: 'BTC', side: 'buy', qty: 0.001, type: 'limit' } })
+check('limit without price 400', res.status === 400, (await res.json()).error)
+
+res = await call('POST', '/orders', { body: { symbol: 'BTC', side: 'buy', qty: 0.001, type: 'bogus' } })
+check('unknown order type 400', res.status === 400, (await res.json()).error)
+
+res = await call('POST', '/orders', {
+  body: { symbol: 'BTC', side: 'buy', qty: 1, type: 'limit', price: 100000 },
+})
+check('limit uses price for the cap', res.status === 400, (await res.json()).error)
+
+res = await call('POST', '/orders', {
+  body: { symbol: 'BTC', side: 'buy', qty: 0.001, type: 'limit', price: 50000 },
+})
+check('limit under the cap reaches the venue', res.status !== 400 && res.status !== 429, `status ${res.status}`)
+
+res = await call('GET', '/working')
+check('working orders reaches the venue', res.status !== 400 && res.status !== 404, `status ${res.status}`)
+
 res = await call('POST', '/close', { body: { symbol: 'BTC' } })
 check('close reaches venue (not 400)', res.status !== 400 && res.status !== 401, `status ${res.status}`)
 

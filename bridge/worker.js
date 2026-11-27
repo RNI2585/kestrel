@@ -10,7 +10,8 @@
  * Routes:
  *   GET  /account    prove the key works, return the account behind it
  *   GET  /positions  the venue's open positions
- *   POST /orders     place a market order (terminal symbol, buy/sell, qty)
+ *   POST /orders     place an order: market by default, limit with type:limit + price
+ *   GET  /working    the venue's working (resting) orders
  *   POST /close      close the position in one symbol
  *   POST /cancel     cancel one working order by its numeric id
  *   GET  /health     what this deployment is configured with, no secrets
@@ -27,6 +28,7 @@
  *   RATE_DB                optional: a D1 binding; when present the counter is
  *                          shared by every isolate, otherwise it is per-isolate
  *   CLOSE_PATH/CANCEL_PATH optional: venue paths, if they differ from the defaults
+ *   LIMIT_PATH             optional: venue limit-order path, if it differs
  *
  * Both paths are confirmed against the live venue: /cancel answers ORDER_NOT_FOUND
  * for an unknown id (and WRONG_ARGS for a quoted one), /close answers for a real
@@ -41,6 +43,8 @@ const BASE = 'https://www.primexbt.partners'
 const ACCOUNT_PATH = '/v3/trading/account'
 const POSITIONS_PATH = '/v3/trading/positions'
 const ORDER_PATH = '/v3/trading/orders/market/place'
+const LIMIT_ORDER_PATH = '/v3/trading/orders/limit/place'
+const ACTIVE_ORDERS_PATH = '/v3/trading/orders/active'
 const DEFAULT_CLOSE_PATH = '/v3/trading/positions/close'
 const DEFAULT_CANCEL_PATH = '/v3/trading/orders/cancel'
 const UPSTREAM_TIMEOUT_MS = 8000
@@ -106,6 +110,7 @@ async function serve(request, env) {
             account: 'GET /account',
             positions: 'GET /positions',
             orders: 'POST /orders',
+            working: 'GET /working',
             close: 'POST /close',
             cancel: 'POST /cancel',
           },
@@ -159,6 +164,10 @@ async function serve(request, env) {
       return order(request, env, cors)
     }
 
+    if (url.pathname === '/working' && request.method === 'GET') {
+      return relay(await callVenue(env, 'GET', ACTIVE_ORDERS_PATH), cors)
+    }
+
     if (url.pathname === '/close' && request.method === 'POST') {
       return close(request, env, cors)
     }
@@ -208,9 +217,18 @@ async function order(request, env, cors) {
     return json({ error: 'qty must be a positive number' }, 400, cors)
   }
 
+  const type = String(body.type ?? 'market').trim().toLowerCase()
+  if (type !== 'market' && type !== 'limit') {
+    return json({ error: 'type must be market or limit' }, 400, cors)
+  }
+  const limitPrice = Number(body.price)
+  if (type === 'limit' && (!Number.isFinite(limitPrice) || limitPrice <= 0)) {
+    return json({ error: 'a limit order needs price' }, 400, cors)
+  }
+
   const cap = Number(env.MAX_NOTIONAL)
   if (Number.isFinite(cap) && cap > 0) {
-    const price = Number(body.reference_price ?? body.price)
+    const price = Number(body.reference_price ?? (type === 'limit' ? limitPrice : NaN))
     if (!Number.isFinite(price) || price <= 0) {
       return json(
         { error: 'MAX_NOTIONAL is set, so the order needs reference_price to size it' },
@@ -231,11 +249,13 @@ async function order(request, env, cors) {
   }
 
   const payload = { symbol, side, qty }
+  if (type === 'limit') payload.price = limitPrice
   const clientOrderId = cleanId(body.client_order_id ?? body.clientOrderId)
   if (clientOrderId) payload.clientOrderId = clientOrderId
 
-  const result = await callVenue(env, 'POST', ORDER_PATH, payload)
-  return relay(result, cors)
+  const path =
+    type === 'limit' ? (env.LIMIT_PATH ?? '').trim() || LIMIT_ORDER_PATH : ORDER_PATH
+  return relay(await callVenue(env, 'POST', path, payload), cors)
 }
 
 /** Closes the open position in one symbol. */
