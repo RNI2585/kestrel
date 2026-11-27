@@ -214,8 +214,10 @@ export default function Brokers({ connections, activeId, onSave, onRemove, onRou
                           </label>
                           <p className="broker__note">
                             Leave both blank to use {def.accountPath || '—'} and{' '}
-                            {def.orderPath || '—'}. Signing is built in this browser; a path you
-                            override is signed exactly as typed.
+                            {def.orderPath || '—'}.{' '}
+                            {def.auth === 'bearer'
+                              ? 'This card signs nothing: it sends the bearer token to your endpoint, and the bridge signs for the venue.'
+                              : 'Signing is built in this browser; a path you override is signed exactly as typed.'}
                           </p>
                         </details>
 
@@ -319,7 +321,7 @@ function missingFields(def: BrokerDef, form: Draft): string[] {
   const missing: string[] = []
   if (!form.endpoint.trim()) missing.push('an endpoint')
   if (def.keyLabel && !form.key.trim()) missing.push(def.keyLabel)
-  if (def.secretLabel && !form.secret.trim()) missing.push(def.secretLabel)
+  if (def.secretLabel && !def.secretOptional && !form.secret.trim()) missing.push(def.secretLabel)
   return missing
 }
 

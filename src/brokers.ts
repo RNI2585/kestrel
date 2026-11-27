@@ -5,6 +5,7 @@ export type BrokerKind =
   | 'bybit'
   | 'kraken'
   | 'primexbt'
+  | 'primexbt-bridge'
   | 'binance'
   | 'custom'
 
@@ -24,6 +25,8 @@ export interface BrokerDef {
   orderPath: string
   keyLabel: string
   secretLabel: string
+  /** The second credential is optional, so Connect can be tried with just the key. */
+  secretOptional?: boolean
   secretHint: string
   docsUrl: string
   /** Which of the terminal's instruments this venue actually lists. */
@@ -145,7 +148,7 @@ export const BROKER_DEFS: BrokerDef[] = [
     auth: 'primexbt',
     defaultEndpoint: 'https://www.primexbt.partners',
     accountPath: '/v3/trading/account',
-    orderPath: '/v3/trading/orders/market',
+    orderPath: '/v3/trading/orders/market/place',
     keyLabel: 'Key id',
     secretLabel: 'Secret key',
     secretHint: 'The base64 PKCS8 Ed25519 secret shown once when the key was created.',
@@ -169,6 +172,24 @@ export const BROKER_DEFS: BrokerDef[] = [
     coverage: 'Spot BTCUSDT, ETHUSDT, SOLUSDT.',
   },
   {
+    kind: 'primexbt-bridge',
+    name: 'PrimeXBT via bridge',
+    group: 'Custom',
+    blurb:
+      'Trades a real PrimeXBT account through the signing bridge. The terminal only holds the bridge URL and its token — the PrimeXBT key id and Ed25519 secret stay on the bridge, so they never reach this browser.',
+    auth: 'bearer',
+    defaultEndpoint: 'https://kestrel-primexbt-bridge-ymtwnj-preview.freebuff.site',
+    accountPath: '/account',
+    orderPath: '/orders',
+    keyLabel: 'Bridge token',
+    secretLabel: 'Second key',
+    secretOptional: true,
+    secretHint:
+      'Bridge token: the BRIDGE_TOKEN stored as a secret on the bridge deployment, sent as a bearer token. This is not your PrimeXBT key id. Second key: only needed when the bridge also sets BRIDGE_SECRET, where it is sent as X-Bridge-Key. Leave it blank otherwise.',
+    docsUrl: '',
+    coverage: 'BTC/USD, ETH/USD, SOL/USD, as forwarded by the bridge.',
+  },
+  {
     kind: 'custom',
     name: 'Custom bridge',
     group: 'Custom',
@@ -179,8 +200,10 @@ export const BROKER_DEFS: BrokerDef[] = [
     accountPath: '/account',
     orderPath: '/orders',
     keyLabel: 'Bearer token',
-    secretLabel: '',
-    secretHint: 'Sent as an Authorization header.',
+    secretLabel: 'Second key',
+    secretOptional: true,
+    secretHint:
+      'Optional. Sent as an X-Bridge-Key header, for a bridge that wants a second credential alongside the bearer token. Leave blank if your bridge only checks the token.',
     docsUrl: '',
     coverage: 'Whatever your bridge accepts.',
   },
@@ -196,9 +219,16 @@ const VENUE_PAIRS: Partial<Record<BrokerKind, Record<string, string>>> = {
   binance: { BTC: 'BTCUSDT', ETH: 'ETHUSDT', SOL: 'SOLUSDT' },
   kraken: { BTC: 'XBTUSD', ETH: 'ETHUSD', SOL: 'SOLUSD' },
   primexbt: { BTC: 'BTC/USD', ETH: 'ETH/USD', SOL: 'SOL/USD' },
+  'primexbt-bridge': { BTC: 'BTC/USD', ETH: 'ETH/USD', SOL: 'SOL/USD' },
 }
 
-const STRICT_VENUES: BrokerKind[] = ['bybit', 'binance', 'kraken', 'primexbt']
+const STRICT_VENUES: BrokerKind[] = [
+  'bybit',
+  'binance',
+  'kraken',
+  'primexbt',
+  'primexbt-bridge',
+]
 
 /**
  * The terminal's symbol translated into the venue's instrument name, or null
@@ -300,9 +330,10 @@ interface BuiltRequest {
   init: RequestInit
 }
 
-function bearerHeaders(key: string): Record<string, string> {
+function bearerHeaders(key: string, second = ''): Record<string, string> {
   const headers: Record<string, string> = {}
   if (key) headers.Authorization = `Bearer ${key}`
+  if (second.trim()) headers['X-Bridge-Key'] = second.trim()
   return headers
 }
 
@@ -463,7 +494,13 @@ async function buildAccountRequest(conn: BrokerConnection, def: BrokerDef): Prom
     case 'primexbt':
       return primexbtRequest(conn, base, path, 'GET', null)
     default:
-      return { url: `${base}${path}`, init: { method: 'GET', headers: bearerHeaders(conn.key.trim()) } }
+      return {
+        url: `${base}${path}`,
+        init: {
+          method: 'GET',
+          headers: bearerHeaders(conn.key.trim(), conn.secret),
+        },
+      }
   }
 }
 
@@ -538,7 +575,7 @@ async function buildOrderRequest(
           method: 'POST',
           headers: {
             'content-type': 'application/json',
-            ...bearerHeaders(conn.key.trim()),
+            ...bearerHeaders(conn.key.trim(), conn.secret),
           },
           body: JSON.stringify({
             symbol,
@@ -594,6 +631,9 @@ function failureHint(conn: BrokerConnection, def: BrokerDef, err: unknown): stri
   if (err instanceof ConfigError) return err.message
   if (err instanceof DOMException && err.name === 'AbortError') {
     return `${def.name} did not answer in time.`
+  }
+  if (def.auth === 'primexbt') {
+    return `PrimeXBT refuses direct browser calls (CORS), so the signed request never got out. Use the PrimeXBT via bridge card instead — it sends your bridge token to a Worker that signs for you, with account path /account and order path /orders.`
   }
   return `${conn.label} could not be reached from this browser. Most exchanges block direct calls with CORS — run a small bridge at ${endpointOf(conn) || 'an endpoint you control'} and point this connection at it.`
 }
