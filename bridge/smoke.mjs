@@ -58,15 +58,26 @@ check('close reaches venue (not 400)', res.status !== 400 && res.status !== 401,
 res = await call('POST', '/cancel', { body: {} })
 check('cancel without id 400', res.status === 400)
 
+res = await call('POST', '/cancel', { body: { orderId: 'kestrelprobe1' } })
+check('cancel refuses a non-numeric id', res.status === 400, (await res.json()).error)
+
+res = await call('POST', '/cancel', { body: { orderId: '999999999999' } })
+check('numeric cancel reaches the venue', res.status !== 400 && res.status !== 401, `status ${res.status}`)
+
 res = await call('POST', '/orders', { body: { symbol: 'BTC', side: 'buy', qty: 0.001, reference_price: 69000 } })
 check('under cap passes auth/limits', res.status !== 400 && res.status !== 401 && res.status !== 429, `status ${res.status}`)
 
 let sawLimit = 0
+let memoryScope = ''
 for (let i = 0; i < 40; i++) {
   const r = await call('POST', '/cancel', { body: {} })
-  if (r.status === 429) sawLimit++
+  if (r.status === 429) {
+    sawLimit++
+    memoryScope = r.headers.get('x-rate-scope') ?? ''
+  }
 }
 check('rate limit engages', sawLimit > 0, `${sawLimit} of 40 were 429`)
+check('memory limiter labels itself', memoryScope === 'memory', memoryScope || 'no header')
 
 // A D1 binding should make the counter shared rather than per-isolate.
 const rows = new Map()
@@ -95,11 +106,16 @@ const fakeDb = {
 const durableEnv = { ...env, RATE_LIMIT_PER_MINUTE: '3', RATE_DB: fakeDb }
 
 let durableHits = 0
+let durableScope = ''
 for (let i = 0; i < 6; i++) {
   const r = await call('POST', '/cancel', { body: {}, env: durableEnv })
-  if (r.status === 429) durableHits++
+  if (r.status === 429) {
+    durableHits++
+    durableScope = r.headers.get('x-rate-scope') ?? ''
+  }
 }
 check('durable limiter shares one counter', durableHits === 3, `${durableHits} of 6 were 429`)
+check('durable limiter labels itself', durableScope === 'durable', durableScope || 'no header')
 
 const durableHealth = await (await call('GET', '/health', { token: '', env: durableEnv })).json()
 check('health reports durable scope', durableHealth.limits?.rateLimitScope === 'durable (D1)')

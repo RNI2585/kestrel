@@ -12,7 +12,7 @@
  *   GET  /positions  the venue's open positions
  *   POST /orders     place a market order (terminal symbol, buy/sell, qty)
  *   POST /close      close the position in one symbol
- *   POST /cancel     cancel one working order by id
+ *   POST /cancel     cancel one working order by its numeric id
  *   GET  /health     what this deployment is configured with, no secrets
  *
  * Configuration (Cloudflare secrets, never in the repo and never in the app):
@@ -28,9 +28,10 @@
  *                          shared by every isolate, otherwise it is per-isolate
  *   CLOSE_PATH/CANCEL_PATH optional: venue paths, if they differ from the defaults
  *
- * The close and cancel paths are the venue paths this bridge assumes; they are
- * overridable per deployment because PrimeXBT has not published them in the
- * public reference. Anything the venue refuses is relayed verbatim.
+ * Both paths are confirmed against the live venue: /cancel answers ORDER_NOT_FOUND
+ * for an unknown id (and WRONG_ARGS for a quoted one), /close answers for a real
+ * position. They stay overridable per deployment. Anything the venue refuses is
+ * relayed verbatim.
  *
  * The bridge refuses to run without all three required values. A half-configured
  * deployment that accepts orders is worse than one that answers 503.
@@ -136,8 +137,14 @@ async function serve(request, env) {
 
     // D1 makes the counter shared, so a token holder cannot multiply its budget
     // by landing on a fresh isolate. Without RATE_DB this is per-isolate only.
-    if (await overLimit(env, clientKey(request))) {
-      return json({ error: 'Too many requests — slow down' }, 429, cors)
+    const limit = await overLimit(env, clientKey(request))
+    if (limit.limited) {
+      return json(
+        { error: 'Too many requests — slow down' },
+        429,
+        // Which counter refused; useful when proving the D1 path is live.
+        { ...cors, 'x-rate-scope': limit.scope },
+      )
     }
 
     if (url.pathname === '/account' && request.method === 'GET') {
@@ -252,16 +259,26 @@ async function close(request, env, cors) {
   return relay(await callVenue(env, 'POST', path, payload), cors)
 }
 
-/** Cancels one working order. */
+/**
+ * Cancels one working order. The venue takes the order id as a JSON number and
+ * answers WRONG_ARGS to a quoted one, so a numeric id is the only accepted form.
+ */
 async function cancel(request, env, cors) {
   const body = await readJson(request, cors)
   if (!body) return json({ error: 'Body must be JSON' }, 400, cors)
 
-  const orderId = cleanId(body.orderId ?? body.order_id ?? body.clientOrderId)
-  if (!orderId) return json({ error: 'orderId is required' }, 400, cors)
+  const raw = String(body.orderId ?? body.order_id ?? body.clientOrderId ?? '').trim()
+  if (!raw) return json({ error: 'orderId is required' }, 400, cors)
+  if (!/^\d{1,19}$/.test(raw)) {
+    return json(
+      { error: 'orderId must be the numeric order id the venue returned, not an id like ' + JSON.stringify(raw) },
+      400,
+      cors,
+    )
+  }
 
   const path = (env.CANCEL_PATH ?? '').trim() || DEFAULT_CANCEL_PATH
-  return relay(await callVenue(env, 'POST', path, { orderId }), cors)
+  return relay(await callVenue(env, 'POST', path, { orderId: Number(raw) }), cors)
 }
 
 async function readJson(request, cors) {
@@ -377,9 +394,9 @@ const buckets = new Map()
 async function overLimit(env, key) {
   if (env.RATE_DB) {
     const durable = await durableLimit(env, key)
-    if (durable !== null) return durable
+    if (durable !== null) return { limited: durable, scope: 'durable' }
   }
-  return rateLimited(env, key)
+  return { limited: rateLimited(env, key), scope: 'memory' }
 }
 
 let rateTableReady = false
