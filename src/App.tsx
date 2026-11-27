@@ -1736,7 +1736,7 @@ export default function App() {
       window.alert('Wait for the broker order to finish before restoring a backup.')
       return
     }
-    applyState(withoutSecrets(next))
+    applyState(next)
   }
 
   const change = changePct(instrument)

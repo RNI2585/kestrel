@@ -60,6 +60,10 @@ export interface StoredState {
   governor: DayAnchor
 }
 
+export type BackupState = Omit<StoredState, 'brokers'> & {
+  brokers: Array<Omit<BrokerConnection, 'key' | 'secret'>>
+}
+
 export const DESK_STORAGE_KEY = 'kestrel.terminal.v1'
 /** A rolling snapshot, kept so a corrupt or half-written save cannot lose the desk. */
 const STORAGE_BACKUP_KEY = 'kestrel.terminal.backup.v1'
@@ -387,10 +391,10 @@ export function parseState(raw: string | null): StoredState | null {
           rawBroker.label.length > 100 ||
           typeof rawBroker.endpoint !== 'string' ||
           rawBroker.endpoint.length > 2048 ||
-          typeof rawBroker.key !== 'string' ||
-          rawBroker.key.length > 4096 ||
-          typeof rawBroker.secret !== 'string' ||
-          rawBroker.secret.length > 4096 ||
+          (rawBroker.key !== undefined &&
+            (typeof rawBroker.key !== 'string' || rawBroker.key.length > 4096)) ||
+          (rawBroker.secret !== undefined &&
+            (typeof rawBroker.secret !== 'string' || rawBroker.secret.length > 4096)) ||
           typeof rawBroker.message !== 'string' ||
           rawBroker.message.length > 1000
         ) {
@@ -401,10 +405,10 @@ export function parseState(raw: string | null): StoredState | null {
           kind: def.kind,
           label: rawBroker.label,
           endpoint: rawBroker.endpoint,
-          key: rawBroker.key,
-          secret: rawBroker.secret,
-          status: rawBroker.status === 'linked' ? 'linked' : 'error',
-          message: rawBroker.message,
+          key: '',
+          secret: '',
+          status: 'error',
+          message: 'Keys are not part of a backup — re-enter them',
         }
         if (typeof rawBroker.accountPath === 'string' && rawBroker.accountPath.length <= 512) {
           broker.accountPath = rawBroker.accountPath
@@ -531,8 +535,27 @@ export function loadState(): StoredState {
   return emptyState()
 }
 
-/** Persisted saves never carry broker keys, so restored venues ask for them again. */
-export function withoutSecrets(state: StoredState): StoredState {
+function brokerWithoutSecrets(
+  broker: BrokerConnection,
+): Omit<BrokerConnection, 'key' | 'secret'> {
+  return {
+    id: broker.id,
+    kind: broker.kind,
+    label: broker.label,
+    endpoint: broker.endpoint,
+    ...(broker.accountPath !== undefined ? { accountPath: broker.accountPath } : {}),
+    ...(broker.orderPath !== undefined ? { orderPath: broker.orderPath } : {}),
+    status: broker.kind === 'paper' ? broker.status : 'error',
+    message:
+      broker.kind === 'paper'
+        ? broker.message
+        : 'Keys are not part of a backup — re-enter them',
+    ...(broker.checkedAt !== undefined ? { checkedAt: broker.checkedAt } : {}),
+  }
+}
+
+/** Backups never carry broker keys, so restored venues ask for them again. */
+export function withoutSecrets(state: StoredState): BackupState {
   return {
     portfolio: state.portfolio,
     fills: state.fills,
@@ -540,22 +563,7 @@ export function withoutSecrets(state: StoredState): StoredState {
     bot: state.bot,
     orders: state.orders,
     equity: state.equity,
-    brokers: state.brokers.map((broker) => ({
-      id: broker.id,
-      kind: broker.kind,
-      label: broker.label,
-      endpoint: broker.endpoint,
-      key: '',
-      secret: '',
-      ...(broker.accountPath !== undefined ? { accountPath: broker.accountPath } : {}),
-      ...(broker.orderPath !== undefined ? { orderPath: broker.orderPath } : {}),
-      status: broker.kind === 'paper' ? broker.status : ('error' as const),
-      message:
-        broker.kind === 'paper'
-          ? broker.message
-          : 'Keys are not part of a backup — re-enter them',
-      ...(broker.checkedAt !== undefined ? { checkedAt: broker.checkedAt } : {}),
-    })),
+    brokers: state.brokers.map(brokerWithoutSecrets),
     activeBroker: state.activeBroker,
     routes: state.routes,
     exits: state.exits,
@@ -566,20 +574,19 @@ export function withoutSecrets(state: StoredState): StoredState {
 
 /** What actually goes to storage: trimmed, newest-first, no secrets. */
 function serialise(state: StoredState): string {
-  const saved = withoutSecrets(state)
   return JSON.stringify({
-    portfolio: saved.portfolio,
-    fills: saved.fills.slice(0, 80),
-    history: saved.history.slice(0, 1200),
-    bot: saved.bot,
-    orders: saved.orders.slice(0, 40),
-    equity: saved.equity.slice(-1200),
-    brokers: saved.brokers,
-    activeBroker: saved.activeBroker,
-    routes: saved.routes,
-    exits: saved.exits,
-    audit: saved.audit.slice(0, 200),
-    governor: saved.governor,
+    portfolio: state.portfolio,
+    fills: state.fills.slice(0, 80),
+    history: state.history.slice(0, 1200),
+    bot: state.bot,
+    orders: state.orders.slice(0, 40),
+    equity: state.equity.slice(-1200),
+    brokers: state.brokers.map(brokerWithoutSecrets),
+    activeBroker: state.activeBroker,
+    routes: state.routes,
+    exits: state.exits,
+    audit: state.audit.slice(0, 200),
+    governor: state.governor,
   })
 }
 
@@ -597,8 +604,9 @@ export function saveDesk(state: StoredState, now = Date.now()): boolean {
     const current = localStorage.getItem(DESK_STORAGE_KEY)
     if (current !== expectedPrimary) return false
     if (now - lastBackupAt > BACKUP_EVERY_MS) {
-      if (current && parseState(current)) {
-        localStorage.setItem(STORAGE_BACKUP_KEY, current)
+      const previous = current ? parseState(current) : null
+      if (previous) {
+        localStorage.setItem(STORAGE_BACKUP_KEY, serialise(previous))
         lastBackupAt = now
       }
     }

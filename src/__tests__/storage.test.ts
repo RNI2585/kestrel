@@ -136,11 +136,27 @@ describe('saved portfolio validation', () => {
     const state = loadState()
     state.brokers = [
       { ...paperConnection(), key: 'sensitive-key', secret: 'sensitive-secret' },
+      {
+        ...paperConnection(),
+        id: 'custom',
+        kind: 'custom',
+        label: 'Custom bridge',
+        endpoint: 'https://bridge.example',
+        key: 'bridge-key',
+        secret: 'bridge-secret',
+      },
     ]
 
     expect(saveDesk(state)).toBe(true)
     const saved = JSON.parse(values.get(DESK_STORAGE_KEY) ?? 'null')
-    expect(saved.brokers[0]).toMatchObject({ key: '', secret: '' })
+    expect(saved.brokers[0]).not.toHaveProperty('key')
+    expect(saved.brokers[0]).not.toHaveProperty('secret')
     expect(JSON.stringify(saved)).not.toContain('sensitive-')
+    expect(JSON.stringify(saved)).not.toContain('bridge-')
+    expect(parseState(values.get(DESK_STORAGE_KEY) ?? null)?.brokers[1]).toMatchObject({
+      key: '',
+      secret: '',
+      status: 'error',
+    })
   })
 })
