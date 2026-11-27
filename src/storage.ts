@@ -531,21 +531,36 @@ export function loadState(): StoredState {
   return emptyState()
 }
 
-/** Backups never carry broker keys, so restored venues ask for them again. */
+/** Persisted saves never carry broker keys, so restored venues ask for them again. */
 export function withoutSecrets(state: StoredState): StoredState {
   return {
-    ...state,
-    brokers: state.brokers.map((b) =>
-      b.kind === 'paper'
-        ? b
-        : {
-            ...b,
-            key: '',
-            secret: '',
-            status: 'error' as const,
-            message: 'Keys are not part of a backup — re-enter them',
-          },
-    ),
+    portfolio: state.portfolio,
+    fills: state.fills,
+    history: state.history,
+    bot: state.bot,
+    orders: state.orders,
+    equity: state.equity,
+    brokers: state.brokers.map((broker) => ({
+      id: broker.id,
+      kind: broker.kind,
+      label: broker.label,
+      endpoint: broker.endpoint,
+      key: '',
+      secret: '',
+      ...(broker.accountPath !== undefined ? { accountPath: broker.accountPath } : {}),
+      ...(broker.orderPath !== undefined ? { orderPath: broker.orderPath } : {}),
+      status: broker.kind === 'paper' ? broker.status : ('error' as const),
+      message:
+        broker.kind === 'paper'
+          ? broker.message
+          : 'Keys are not part of a backup — re-enter them',
+      ...(broker.checkedAt !== undefined ? { checkedAt: broker.checkedAt } : {}),
+    })),
+    activeBroker: state.activeBroker,
+    routes: state.routes,
+    exits: state.exits,
+    audit: state.audit,
+    governor: state.governor,
   }
 }
 

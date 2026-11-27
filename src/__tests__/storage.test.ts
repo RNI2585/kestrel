@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { START_CASH } from '../trade'
+import { paperConnection } from '../brokers'
 import { loadSettings } from '../settings'
 import { DESK_STORAGE_KEY, loadBot, loadState, parseState, saveDesk } from '../storage'
 
@@ -124,5 +125,22 @@ describe('saved portfolio validation', () => {
     expect(saveDesk(state)).toBe(true)
     values.set(DESK_STORAGE_KEY, 'updated elsewhere')
     expect(saveDesk(state)).toBe(false)
+  })
+
+  it('never persists broker credentials, even on a paper connection', () => {
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, String(value)),
+    })
+    const state = loadState()
+    state.brokers = [
+      { ...paperConnection(), key: 'sensitive-key', secret: 'sensitive-secret' },
+    ]
+
+    expect(saveDesk(state)).toBe(true)
+    const saved = JSON.parse(values.get(DESK_STORAGE_KEY) ?? 'null')
+    expect(saved.brokers[0]).toMatchObject({ key: '', secret: '' })
+    expect(JSON.stringify(saved)).not.toContain('sensitive-')
   })
 })
