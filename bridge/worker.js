@@ -24,6 +24,8 @@
  *   ALLOWED_SYMBOLS        optional: comma list, e.g. BTC,ETH — everything else 400s
  *   MAX_NOTIONAL           optional: largest order in USD; needs a reference price
  *   RATE_LIMIT_PER_MINUTE  optional: requests per minute per client, default 30
+ *   RATE_DB                optional: a D1 binding; when present the counter is
+ *                          shared by every isolate, otherwise it is per-isolate
  *   CLOSE_PATH/CANCEL_PATH optional: venue paths, if they differ from the defaults
  *
  * The close and cancel paths are the venue paths this bridge assumes; they are
@@ -97,6 +99,7 @@ async function serve(request, env) {
             symbols: allowedSymbols(env),
             maxNotional: Number(env.MAX_NOTIONAL) > 0 ? Number(env.MAX_NOTIONAL) : null,
             rateLimitPerMinute: rateLimitOf(env),
+            rateLimitScope: env.RATE_DB ? 'durable (D1)' : 'per-isolate',
           },
           routes: {
             account: 'GET /account',
@@ -131,9 +134,9 @@ async function serve(request, env) {
       )
     }
 
-    // Best effort: one isolate's counters. It stops a runaway loop from this
-    // client; it is not a distributed limiter.
-    if (rateLimited(env, clientKey(request))) {
+    // D1 makes the counter shared, so a token holder cannot multiply its budget
+    // by landing on a fresh isolate. Without RATE_DB this is per-isolate only.
+    if (await overLimit(env, clientKey(request))) {
       return json({ error: 'Too many requests — slow down' }, 429, cors)
     }
 
@@ -369,6 +372,58 @@ function rateLimitOf(env) {
 }
 
 const buckets = new Map()
+
+/** The shared counter when RATE_DB is bound, else the in-memory one. */
+async function overLimit(env, key) {
+  if (env.RATE_DB) {
+    const durable = await durableLimit(env, key)
+    if (durable !== null) return durable
+  }
+  return rateLimited(env, key)
+}
+
+let rateTableReady = false
+
+/**
+ * One row per client per wall-clock minute. Returns null when D1 is unusable,
+ * so a database problem degrades to the in-memory limiter instead of failing
+ * requests.
+ */
+async function durableLimit(env, key) {
+  const limit = rateLimitOf(env)
+  const window = Math.floor(Date.now() / 60_000)
+  try {
+    if (!rateTableReady) {
+      await env.RATE_DB.prepare(
+        'CREATE TABLE IF NOT EXISTS rate_limit (client TEXT NOT NULL, window INTEGER NOT NULL, hits INTEGER NOT NULL, PRIMARY KEY (client, window))',
+      ).run()
+      rateTableReady = true
+    }
+    const row = await env.RATE_DB.prepare(
+      'INSERT INTO rate_limit (client, window, hits) VALUES (?1, ?2, 1) ON CONFLICT(client, window) DO UPDATE SET hits = hits + 1 RETURNING hits',
+    )
+      .bind(key, window)
+      .first()
+    if (window % 15 === 0) {
+      const old = window - 5
+      await env.RATE_DB.prepare('DELETE FROM rate_limit WHERE window < ?1').bind(old).run()
+    }
+    return Number(row?.hits ?? 1) > limit
+  } catch (err) {
+    try {
+      console.log(
+        JSON.stringify({
+          bridge: 'kestrel-primexbt',
+          rateDb: 'unavailable',
+          error: String(err?.message ?? err),
+        }),
+      )
+    } catch {
+      // logging must never break a request
+    }
+    return null
+  }
+}
 
 /** Sliding minute counter per client, inside this isolate only. */
 function rateLimited(env, key) {

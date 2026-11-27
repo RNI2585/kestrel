@@ -9,7 +9,7 @@ const env = {
   RATE_LIMIT_PER_MINUTE: '30',
 }
 
-const call = (method, path, { token = 'test-token', body, headers = {} } = {}) =>
+const call = (method, path, { token = 'test-token', body, headers = {}, env: target = env } = {}) =>
   worker.fetch(
     new Request(`https://b.test${path}`, {
       method,
@@ -21,7 +21,7 @@ const call = (method, path, { token = 'test-token', body, headers = {} } = {}) =
       },
       body: body ? JSON.stringify(body) : undefined,
     }),
-    env,
+    target,
   )
 
 const results = []
@@ -67,6 +67,50 @@ for (let i = 0; i < 40; i++) {
   if (r.status === 429) sawLimit++
 }
 check('rate limit engages', sawLimit > 0, `${sawLimit} of 40 were 429`)
+
+// A D1 binding should make the counter shared rather than per-isolate.
+const rows = new Map()
+const fakeDb = {
+  prepare(sql) {
+    let args = []
+    const stmt = {
+      bind(...a) {
+        args = a
+        return stmt
+      },
+      async run() {
+        return { success: true }
+      },
+      async first() {
+        if (!sql.startsWith('INSERT')) return null
+        const row = `${args[0]}|${args[1]}`
+        const hits = (rows.get(row) ?? 0) + 1
+        rows.set(row, hits)
+        return { hits }
+      },
+    }
+    return stmt
+  },
+}
+const durableEnv = { ...env, RATE_LIMIT_PER_MINUTE: '3', RATE_DB: fakeDb }
+
+let durableHits = 0
+for (let i = 0; i < 6; i++) {
+  const r = await call('POST', '/cancel', { body: {}, env: durableEnv })
+  if (r.status === 429) durableHits++
+}
+check('durable limiter shares one counter', durableHits === 3, `${durableHits} of 6 were 429`)
+
+const durableHealth = await (await call('GET', '/health', { token: '', env: durableEnv })).json()
+check('health reports durable scope', durableHealth.limits?.rateLimitScope === 'durable (D1)')
+
+const brokenEnv = { ...env, RATE_DB: { prepare() { throw new Error('no db') } } }
+const fallback = await call('POST', '/cancel', {
+  body: {},
+  env: brokenEnv,
+  headers: { 'cf-connecting-ip': '10.9.9.9' },
+})
+check('broken RATE_DB falls back to memory', fallback.status === 400, `status ${fallback.status}`)
 
 console.log(results.join('\n'))
 const failed = results.filter((r) => r.startsWith('FAIL'))
